@@ -33,18 +33,18 @@
 ;;     20260912101500/
 ;;       __scan_of_receipt.pdf
 ;;
-;; File name anatomy: __TITLE[--TAG1-TAG2...][==KEY1=KEY2...].EXT
+;; File name anatomy: __TITLE[--TAG1-TAG2...][==ALIAS1=ALIAS2...].EXT
 ;;
 ;;   - "__"    marks the file as a note's main file
 ;;   - TITLE   a slug of the title, words joined by "_"
 ;;   - "--"    introduces tags, individual tags joined by "-"
-;;   - "=="    introduces keywords, individual keywords joined by "="
+;;   - "=="    introduces aliases, individual aliases joined by "="
 ;;   - EXT     anything: org, md, pdf, ipynb, txt, ...
 ;;
-;; Tags and keywords are both optional, and both mean "a short label
-;; attached to the note" -- the distinction is left to you (e.g. tags
-;; for topic, keywords for status/workflow), but they're kept in
-;; separate namespaces so you can search/filter on either.
+;; Tags and aliases are both optional. Tags are topical labels; an
+;; alias is a user-supplied alternate name the note can also be
+;; found by (e.g. an old title, an abbreviation, a nickname). They're
+;; kept in separate namespaces so you can search/filter on either.
 ;;
 ;; Discovery of notes is done with ripgrep (`rg'), searched by
 ;; filename glob rather than by walking the directory tree from
@@ -128,7 +128,7 @@ Must always expand to 14 digits for `notation-id-regexp' to match."
     (string-trim slug "_+" "_+")))
 
 (defun notation--token (s)
-  "Turn S into a single bare alphanumeric token (for a tag or keyword)."
+  "Turn S into a single bare alphanumeric token (for a tag or alias)."
   (replace-regexp-in-string "[^a-z0-9]+" "" (downcase s)))
 
 (defun notation--tokens-from-string (s)
@@ -138,33 +138,33 @@ Must always expand to 14 digits for `notation-id-regexp' to match."
     (mapcar #'notation--token)
     (delete "")))
 
-(defun notation--file-name (title tags keywords extension)
-  "Build a note file name from TITLE, TAGS, KEYWORDS and EXTENSION.
-TAGS and KEYWORDS are lists of bare tokens (see `notation--token').
+(defun notation--file-name (title tags aliases extension)
+  "Build a note file name from TITLE, TAGS, ALIASES and EXTENSION.
+TAGS and ALIASES are lists of bare tokens (see `notation--token').
 EXTENSION is given without a leading dot."
   (let* ((slug (notation--slug title))
          (tag-part (if tags (concat "--" (mapconcat #'identity tags "-")) ""))
-         (key-part (if keywords (concat "==" (mapconcat #'identity keywords "=")) "")))
-    (concat "__" slug tag-part key-part "." extension)))
+         (alias-part (if aliases (concat "==" (mapconcat #'identity aliases "=")) "")))
+    (concat "__" slug tag-part alias-part "." extension)))
 
 (defun notation--parse-file-name (file)
-  "Return a plist (:title :tags :keywords) parsed from FILE's name."
+  "Return a plist (:title :tags :aliases) parsed from FILE's name."
   (let* ((base (file-name-base file))
          (body (if (string-match notation-marker-regexp base)
                    (substring base (match-end 0))
                  base))
-         keywords tags title)
-    ;; "==" (keyword marker) and "--" (tag marker) can each only occur
-    ;; once, as markers -- title/tag/keyword tokens never contain "="
+         aliases tags title)
+    ;; "==" (alias marker) and "--" (tag marker) can each only occur
+    ;; once, as markers -- title/tag/alias tokens never contain "="
     ;; or "-" themselves -- so a single search for each is unambiguous.
     (when (string-match "==\\(.+\\)\\'" body)
-      (setq keywords (split-string (match-string 1 body) "=" t))
+      (setq aliases (split-string (match-string 1 body) "=" t))
       (setq body (substring body 0 (match-beginning 0))))
     (when (string-match "--\\(.+\\)\\'" body)
       (setq tags (split-string (match-string 1 body) "-" t))
       (setq body (substring body 0 (match-beginning 0))))
     (setq title body)
-    (list :title title :tags tags :keywords keywords)))
+    (list :title title :tags tags :aliases aliases)))
 
 ;;; Internal helpers: discovery via ripgrep
 
@@ -231,14 +231,14 @@ the note lives under, or nil if it's directly under the root."
               (parsed (notation--parse-file-name file))
               (title (plist-get parsed :title))
               (tags (plist-get parsed :tags))
-              (keywords (plist-get parsed :keywords))
+              (aliases (plist-get parsed :aliases))
               (display
                (format "%s  %s%s%s%s"
                        id
                        (if subdir (format "%s/  " subdir) "")
                        title
                        (if tags (format "  [%s]" (mapconcat #'identity tags " ")) "")
-                       (if keywords (format "  {%s}" (mapconcat #'identity keywords " ")) ""))))
+                       (if aliases (format "  {%s}" (mapconcat #'identity aliases " ")) ""))))
          (cons display file))))
     (sort (lambda (a b) (string> (car a) (car b))))))
 
@@ -263,19 +263,19 @@ isn't inside `notation-directory' at all."
             (when parts
               (mapconcat #'identity parts "/"))))))))
 
-(defun notation--insert-front-matter (title tags keywords)
-  "Insert denote-style front matter for TITLE, TAGS and KEYWORDS at point."
+(defun notation--insert-front-matter (title tags aliases)
+  "Insert denote-style front matter for TITLE, TAGS and ALIASES at point."
   (insert "#+title:      " title "\n")
   (insert "#+date:       " (format-time-string "%Y-%m-%d %H:%M") "\n")
   (insert "#+filetags:   " (if tags (concat ":" (mapconcat #'identity tags ":") ":") "") "\n")
-  (insert "#+keywords:   " (if keywords (mapconcat #'identity keywords " ") "") "\n\n"))
+  (insert "#+aliases:    " (if aliases (mapconcat #'identity aliases " ") "") "\n\n"))
 
 ;;; Commands
 
 ;;;###autoload
-(defun notation-new-note (title tags keywords subdir extension)
-  "Create a new note titled TITLE with TAGS and KEYWORDS.
-TAGS and KEYWORDS are read as comma/space separated strings and each
+(defun notation-new-note (title tags aliases subdir extension)
+  "Create a new note titled TITLE with TAGS and ALIASES.
+TAGS and ALIASES are read as comma/space separated strings and each
 split into bare tokens. SUBDIR, if non-empty, is a subdirectory path
 (relative to `notation-directory') the note's id directory is placed
 under, letting notes be organized arbitrarily. When invoked from a
@@ -290,7 +290,7 @@ inside it, and opens it."
   (interactive
    (list (read-string "Title: ")
          (read-string "Tags (comma/space separated, optional): ")
-         (read-string "Keywords (comma/space separated, optional): ")
+         (read-string "Aliases (comma/space separated, optional): ")
          (read-string "Subdirectory (optional, e.g. projects/emacs): "
                       (notation--suggest-subdir))
          (read-string (format "Extension (default %s): " notation-default-extension)
@@ -303,14 +303,14 @@ inside it, and opens it."
                      (expand-file-name (string-trim subdir) notation-directory)))
          (dir (expand-file-name id base-dir))
          (tag-list (notation--tokens-from-string tags))
-         (keyword-list (notation--tokens-from-string keywords))
+         (alias-list (notation--tokens-from-string aliases))
          (ext (string-trim (string-remove-prefix "." extension)))
-         (file-name (notation--file-name title tag-list keyword-list ext))
+         (file-name (notation--file-name title tag-list alias-list ext))
          (path (expand-file-name file-name dir)))
     (make-directory dir t)
     (find-file path)
     (when (member ext '("org" "md" "markdown" "txt"))
-      (notation--insert-front-matter title tag-list keyword-list))
+      (notation--insert-front-matter title tag-list alias-list))
     (save-buffer)
     (message "Created note %s" id)))
 
@@ -328,7 +328,7 @@ inside it, and opens it."
 ;;;###autoload
 (defun notation-rename-note ()
   "Rename the note file visited by the current buffer.
-Prompts for a new title, tags and keywords, keeping the note's
+Prompts for a new title, tags and aliases, keeping the note's
 directory (and therefore its id/timestamp and location) unchanged."
   (interactive)
   (let* ((file (buffer-file-name))
@@ -340,12 +340,12 @@ directory (and therefore its id/timestamp and location) unchanged."
                                 (replace-regexp-in-string "_" " " (plist-get parsed :title))))
            (tags (read-string "Tags: "
                                (mapconcat #'identity (plist-get parsed :tags) " ")))
-           (keywords (read-string "Keywords: "
-                                   (mapconcat #'identity (plist-get parsed :keywords) " ")))
+           (aliases (read-string "Aliases: "
+                                   (mapconcat #'identity (plist-get parsed :aliases) " ")))
            (tag-list (notation--tokens-from-string tags))
-           (keyword-list (notation--tokens-from-string keywords))
+           (alias-list (notation--tokens-from-string aliases))
            (ext (file-name-extension file))
-           (new-name (notation--file-name title tag-list keyword-list ext))
+           (new-name (notation--file-name title tag-list alias-list ext))
            (new-path (expand-file-name new-name dir)))
       (rename-file file new-path)
       (set-visited-file-name new-path t t)

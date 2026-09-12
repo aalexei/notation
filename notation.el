@@ -66,6 +66,12 @@
 ;; `notation-front-matter-function', customizable per taste; the
 ;; default inserts only `#+title:' and `#+filetags:'.
 ;;
+;; A journal is built on the same note structure: each ISO week gets
+;; one ordinary note, filed under journal/<ISO-week-year>/ and titled
+;; with its week id (e.g. "2026-W37"). Within an Org journal note,
+;; each day actually visited gets its own top-level heading, added on
+;; demand rather than pre-created for the whole week.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
@@ -74,11 +80,18 @@
 ;;   M-x notation-follow-link-at-point
 ;;   M-x notation-backlinks
 ;;   M-x notation-doctor
+;;   M-x notation-journal-today
+;;   M-x notation-journal-forward
+;;   M-x notation-journal-backward
 
 ;;; Code:
 
 (require 'seq)
 (require 'subr-x)
+
+(declare-function org-find-exact-headline-in-buffer "org")
+(declare-function org-end-of-subtree "org")
+
 
 ;;; Customization
 
@@ -106,6 +119,32 @@ Must always expand to 14 digits for `notation-id-regexp' to match."
 
 (defcustom notation-rg-executable "rg"
   "Name or path of the ripgrep executable used for note discovery."
+  :type 'string
+  :group 'notation)
+
+(defcustom notation-journal-subdir "journal"
+  "Subdirectory (relative to `notation-directory') holding journal notes.
+Weekly notes are filed under year subdirectories beneath it, e.g.
+journal/2026/<id>/."
+  :type 'string
+  :group 'notation)
+
+(defcustom notation-journal-extension "org"
+  "File extension for journal notes.
+Day-heading creation (finding or making today's entry within the
+current week's note) only applies when the note is visited in
+`org-mode', which this extension is expected to trigger."
+  :type 'string
+  :group 'notation)
+
+(defcustom notation-journal-tags '("journal")
+  "Tags applied to newly created journal notes."
+  :type '(repeat string)
+  :group 'notation)
+
+(defcustom notation-journal-day-heading-format "%Y-%m-%d %A"
+  "`format-time-string' format for a day's heading within a weekly
+journal note, e.g. \"2026-09-07 Monday\"."
   :type 'string
   :group 'notation)
 
@@ -649,6 +688,128 @@ everything checks out, reports so in the echo area instead."
         (display-buffer (current-buffer)))
       (message "notation-doctor: %d problem%s found, see *notation-doctor*"
                 (length problems) (if (= (length problems) 1) "" "s")))))
+
+;;; Journal
+;;
+;; A weekly-note journal: each ISO week gets one ordinary note, filed
+;; under journal/<ISO-week-year>/, titled with its ISO week id (e.g.
+;; "2026-W37"). Within an org journal note, each day that's actually
+;; been visited gets its own top-level heading, added on demand --
+;; days are not pre-created for the whole week.
+
+(defun notation--journal-week-id (time)
+  "Return the ISO week id string for TIME, e.g. \"2026-W37\"."
+  (format-time-string "%G-W%V" time))
+
+(defun notation--journal-subdir (time)
+  "Return the journal subdirectory for TIME's ISO week-year."
+  (concat notation-journal-subdir "/" (format-time-string "%G" time)))
+
+(defun notation--journal-subdir-p (subdir)
+  "Return non-nil if SUBDIR (as from `notation--subdir-from-file') is
+inside `notation-journal-subdir'."
+  (and subdir
+       (or (string= subdir notation-journal-subdir)
+           (string-prefix-p (concat notation-journal-subdir "/") subdir))))
+
+(defun notation--journal-all-notes ()
+  "Return an alist of (WEEK-SLUG . FILE) for every journal note,
+sorted chronologically (oldest first). WEEK-SLUG is the note's
+title as stored in its file name -- already in the same slug form
+produced by `notation--slug', which sorts lexicographically in the
+same order as the underlying dates since ISO week ids are
+zero-padded."
+  (let (result)
+    (dolist (file (notation--find-note-files))
+      (when (notation--journal-subdir-p (notation--subdir-from-file file))
+        (push (cons (plist-get (notation--parse-file-name file) :title) file) result)))
+    (sort result (lambda (a b) (string< (car a) (car b))))))
+
+(defun notation--journal-current-week-slug ()
+  "Return the week-slug of the journal note visited by the current
+buffer, or nil if the current buffer isn't visiting one."
+  (let ((file (buffer-file-name)))
+    (when (and file (notation--note-file-p file)
+               (notation--journal-subdir-p (notation--subdir-from-file file)))
+      (plist-get (notation--parse-file-name file) :title))))
+
+(defun notation--journal-ensure-note (time)
+  "Return the path to the journal note for TIME's ISO week, creating
+it (directory, file, and front matter) first if it doesn't exist."
+  (let* ((week-id (notation--journal-week-id time))
+         (target-slug (notation--slug week-id)))
+    (or (cdr (assoc target-slug (notation--journal-all-notes)))
+        (let* ((id (notation--new-id))
+               (base-dir (expand-file-name (notation--journal-subdir time) notation-directory))
+               (dir (expand-file-name id base-dir))
+               (file-name (notation--file-name week-id notation-journal-tags nil
+                                                notation-journal-extension))
+               (path (expand-file-name file-name dir)))
+          (make-directory dir t)
+          (with-temp-file path
+            (when (member notation-journal-extension '("org" "md" "markdown" "txt"))
+              (insert (funcall notation-front-matter-function week-id notation-journal-tags nil))))
+          path))))
+
+(defun notation--journal-goto-day (time)
+  "In the current Org buffer, move point to the heading for TIME's
+date, appending a new heading at the end of the buffer if it doesn't
+already exist."
+  (let* ((heading (format-time-string notation-journal-day-heading-format time))
+         (pos (org-find-exact-headline-in-buffer heading)))
+    (if pos
+        (progn (goto-char pos) (org-end-of-subtree t t))
+      (goto-char (point-max))
+      (unless (bolp) (insert "\n"))
+      (insert "* " heading "\n"))))
+
+;;;###autoload
+(defun notation-journal-today ()
+  "Open today's journal entry.
+Opens (creating if necessary) the weekly note for the current ISO
+week under journal/<year>/, and -- if it's an Org file -- moves
+point to today's day heading within it, creating that too if it
+doesn't already exist."
+  (interactive)
+  (let ((time (current-time)))
+    (find-file (notation--journal-ensure-note time))
+    (when (derived-mode-p 'org-mode)
+      (notation--journal-goto-day time))))
+
+(defun notation--journal-step (direction)
+  "Open the nearest existing journal note in DIRECTION (1 or -1)
+relative to the current journal note, or relative to today if the
+current buffer isn't visiting a journal note."
+  (let* ((notes (notation--journal-all-notes)))
+    (unless notes
+      (user-error "No journal notes found under %s/%s"
+                  notation-directory notation-journal-subdir))
+    (let* ((current (or (notation--journal-current-week-slug)
+                         (notation--slug (notation--journal-week-id (current-time)))))
+           (slugs (mapcar #'car notes))
+           (target (if (> direction 0)
+                       (seq-find (lambda (s) (string> s current)) slugs)
+                     (car (last (seq-filter (lambda (s) (string< s current)) slugs))))))
+      (unless target
+        (user-error "No %s journal note found"
+                    (if (> direction 0) "later" "earlier")))
+      (find-file (cdr (assoc target notes))))))
+
+;;;###autoload
+(defun notation-journal-forward ()
+  "Open the next existing journal note in time.
+Relative to the journal note in the current buffer, if there is one;
+otherwise relative to today."
+  (interactive)
+  (notation--journal-step 1))
+
+;;;###autoload
+(defun notation-journal-backward ()
+  "Open the previous existing journal note in time.
+Relative to the journal note in the current buffer, if there is one;
+otherwise relative to today."
+  (interactive)
+  (notation--journal-step -1))
 
 ;;; Org integration
 

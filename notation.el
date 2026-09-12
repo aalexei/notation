@@ -1,7 +1,7 @@
 ;;; notation.el --- Computable, denote-like notes, one directory per note -*- lexical-binding: t; -*-
 
 ;; Author: You
-;; Version: 0.1
+;; Version: 0.2
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: outlines, files, convenience
 
@@ -13,21 +13,43 @@
 ;; data, and generated output alongside the note text itself -- the
 ;; goal is notes you can compute on, not just read.
 ;;
-;; Layout:
+;; A note is identified purely structurally: a directory whose name
+;; is a 14-digit timestamp (YYYYMMDDHHMMSS), containing a file whose
+;; name starts with "__". Everything else -- where that directory
+;; sits, what it's called, what the file's extension is -- is free.
+;; This means notes can be filed into arbitrary subdirectories of
+;; `notation-directory' (by topic, by project, however you like)
+;; without breaking discovery.
+;;
+;; Layout example:
 ;;
 ;;   notation-directory/
-;;     20260910143022/
-;;       __my-first-note--emacs-notes.org
-;;     20260910151101/
-;;       __another-note.org
+;;     projects/emacs/
+;;       20260910143022/
+;;         __config_notes--emacs==wip=urgent.org
+;;     journal/2026/
+;;       20260911090000/
+;;         __morning_pages.md
+;;     20260912101500/
+;;       __scan_of_receipt.pdf
 ;;
-;; - The directory name is a 14-digit timestamp: YYYYMMDDHHMMSS
-;; - The file inside follows: __TITLE-SLUG--TAG1-TAG2.org
-;;   (tags and the leading "--" are omitted if there are no tags)
+;; File name anatomy: __TITLE[--TAG1-TAG2...][==KEY1=KEY2...].EXT
 ;;
-;; Keeping each note in its own directory leaves room to drop
-;; attachments (images, PDFs, data files) alongside the note itself
-;; without cluttering a single flat notes directory.
+;;   - "__"    marks the file as a note's main file
+;;   - TITLE   a slug of the title, words joined by "_"
+;;   - "--"    introduces tags, individual tags joined by "-"
+;;   - "=="    introduces keywords, individual keywords joined by "="
+;;   - EXT     anything: org, md, pdf, ipynb, txt, ...
+;;
+;; Tags and keywords are both optional, and both mean "a short label
+;; attached to the note" -- the distinction is left to you (e.g. tags
+;; for topic, keywords for status/workflow), but they're kept in
+;; separate namespaces so you can search/filter on either.
+;;
+;; Discovery of notes is done with ripgrep (`rg'), searched by
+;; filename glob rather than by walking the directory tree from
+;; Emacs Lisp, so it stays fast even with deep or large note trees.
+;; Ripgrep must be installed and on `exec-path'.
 ;;
 ;; Entry points:
 ;;   M-x notation-new-note
@@ -47,12 +69,13 @@
   :prefix "notation-")
 
 (defcustom notation-directory (expand-file-name "~/notes/")
-  "Root directory holding all note directories."
+  "Root directory holding all notes.
+Notes may be organized into arbitrary subdirectories underneath it."
   :type 'directory
   :group 'notation)
 
-(defcustom notation-file-extension ".org"
-  "File extension used for the main note file."
+(defcustom notation-default-extension "org"
+  "Default file extension (without the dot) offered for new notes."
   :type 'string
   :group 'notation)
 
@@ -62,10 +85,18 @@ Must always expand to 14 digits for `notation-id-regexp' to match."
   :type 'string
   :group 'notation)
 
+(defcustom notation-rg-executable "rg"
+  "Name or path of the ripgrep executable used for note discovery."
+  :type 'string
+  :group 'notation)
+
 (defconst notation-id-regexp "\\`[0-9]\\{14\\}\\'"
   "Regexp matching a valid notation note-id directory name.")
 
-;;; Internal helpers
+(defconst notation-marker-regexp "\\`__"
+  "Regexp matching the leading marker of a note's main file name.")
+
+;;; Internal helpers: ids, slugs, file names
 
 (defun notation--ensure-root ()
   "Make sure `notation-directory' exists."
@@ -77,108 +108,190 @@ Must always expand to 14 digits for `notation-id-regexp' to match."
   (notation--ensure-root)
   (let ((id (format-time-string notation-id-format)))
     ;; Guard against creating two notes within the same second.
-    (while (file-directory-p (expand-file-name id notation-directory))
+    ;; Uniqueness only needs to hold within the target directory, but
+    ;; checking globally is simpler and the collision is already rare.
+    (while (notation--id-in-use-p id)
       (sleep-for 0 1000) ;; wait 1s
       (setq id (format-time-string notation-id-format)))
     id))
 
-(defun notation--slug (title)
-  "Turn TITLE into a filename-safe slug."
-  (let* ((down (downcase title))
-         (slug (replace-regexp-in-string "[^a-z0-9]+" "-" down)))
-    (string-trim slug "-+" "-+")))
+(defun notation--id-in-use-p (id)
+  "Return non-nil if ID already names a note directory anywhere."
+  (seq-some (lambda (file)
+              (string= id (notation--id-from-file file)))
+            (notation--find-note-files)))
 
-(defun notation--tags-to-list (tags-string)
-  "Split TAGS-STRING (comma or space separated) into a list of slugs."
+(defun notation--slug (title)
+  "Turn TITLE into a filename-safe slug, words joined by underscores."
+  (let* ((down (downcase title))
+         (slug (replace-regexp-in-string "[^a-z0-9]+" "_" down)))
+    (string-trim slug "_+" "_+")))
+
+(defun notation--token (s)
+  "Turn S into a single bare alphanumeric token (for a tag or keyword)."
+  (replace-regexp-in-string "[^a-z0-9]+" "" (downcase s)))
+
+(defun notation--tokens-from-string (s)
+  "Split S (comma/space separated) into a list of slug tokens."
   (thread-last
-    (split-string tags-string "[,\s]+" t "\s+")
-    (mapcar #'notation--slug)
+    (split-string s "[,\s]+" t "\s+")
+    (mapcar #'notation--token)
     (delete "")))
 
-(defun notation--file-name (title tags)
-  "Build the note file name for TITLE and TAGS (a list of strings)."
+(defun notation--file-name (title tags keywords extension)
+  "Build a note file name from TITLE, TAGS, KEYWORDS and EXTENSION.
+TAGS and KEYWORDS are lists of bare tokens (see `notation--token').
+EXTENSION is given without a leading dot."
   (let* ((slug (notation--slug title))
-         (tag-part (if tags
-                       (concat "--" (mapconcat #'identity tags "-"))
-                     "")))
-    (concat "__" slug tag-part notation-file-extension)))
-
-(defun notation--note-dirs ()
-  "Return a list of absolute paths to all note directories, newest first."
-  (notation--ensure-root)
-  (thread-last
-    (directory-files notation-directory nil notation-id-regexp)
-    (sort (lambda (a b) (string> a b)))
-    (mapcar (lambda (id) (expand-file-name id notation-directory)))))
-
-(defun notation--main-file-in-dir (dir)
-  "Return the path to the main note file inside DIR, or nil."
-  (car (directory-files dir t "\\`__.*\\..+\\'")))
+         (tag-part (if tags (concat "--" (mapconcat #'identity tags "-")) ""))
+         (key-part (if keywords (concat "==" (mapconcat #'identity keywords "=")) "")))
+    (concat "__" slug tag-part key-part "." extension)))
 
 (defun notation--parse-file-name (file)
-  "Return a plist (:title TITLE :tags TAGS) parsed from FILE's name."
+  "Return a plist (:title :tags :keywords) parsed from FILE's name."
   (let* ((base (file-name-base file))
-         ;; strip leading "__"
-         (body (if (string-prefix-p "__" base) (substring base 2) base))
-         (parts (split-string body "--" t)))
-    (list :title (or (car parts) body)
-          :tags (if (cadr parts) (split-string (cadr parts) "-" t) nil))))
+         (body (if (string-match notation-marker-regexp base)
+                   (substring base (match-end 0))
+                 base))
+         keywords tags title)
+    ;; "==" (keyword marker) and "--" (tag marker) can each only occur
+    ;; once, as markers -- title/tag/keyword tokens never contain "="
+    ;; or "-" themselves -- so a single search for each is unambiguous.
+    (when (string-match "==\\(.+\\)\\'" body)
+      (setq keywords (split-string (match-string 1 body) "=" t))
+      (setq body (substring body 0 (match-beginning 0))))
+    (when (string-match "--\\(.+\\)\\'" body)
+      (setq tags (split-string (match-string 1 body) "-" t))
+      (setq body (substring body 0 (match-beginning 0))))
+    (setq title body)
+    (list :title title :tags tags :keywords keywords)))
+
+;;; Internal helpers: discovery via ripgrep
+
+(defun notation--check-rg ()
+  "Signal a user-error if ripgrep isn't available."
+  (unless (executable-find notation-rg-executable)
+    (user-error "Ripgrep (%s) not found; install it or set `notation-rg-executable'"
+                notation-rg-executable)))
+
+(defun notation--find-note-files ()
+  "Return absolute paths of all note main files under `notation-directory'.
+A candidate file is any file whose name starts with \"__\"; results
+are then filtered down to those directly inside a 14-digit id
+directory, which is what actually makes something a note."
+  (notation--ensure-root)
+  (notation--check-rg)
+  (let* ((default-directory notation-directory)
+         (output
+          (with-temp-buffer
+            (let ((status (call-process notation-rg-executable nil t nil
+                                         "--files" "--hidden" "--no-messages"
+                                         "--no-ignore-vcs"
+                                         "-g" "__*")))
+              ;; rg exits 1 when it simply found nothing; only treat
+              ;; other non-zero statuses as real errors.
+              (unless (memq status '(0 1))
+                (error "ripgrep failed: %s" (string-trim (buffer-string))))
+              (buffer-string)))))
+    (thread-last
+      (split-string output "\n" t)
+      (mapcar (lambda (rel) (expand-file-name rel notation-directory)))
+      (seq-filter #'notation--note-file-p))))
+
+(defun notation--note-file-p (file)
+  "Return non-nil if FILE is a valid note main file.
+That means it lives directly inside a directory named with a
+14-digit id."
+  (let ((parent (file-name-nondirectory
+                 (directory-file-name (file-name-directory file)))))
+    (string-match-p notation-id-regexp parent)))
+
+(defun notation--id-from-file (file)
+  "Return the 14-digit id of the note directory containing FILE."
+  (file-name-nondirectory (directory-file-name (file-name-directory file))))
+
+(defun notation--subdir-from-file (file)
+  "Return FILE's path relative to `notation-directory', excluding the
+id directory and file name -- i.e. the arbitrary filing subdirectory
+the note lives under, or nil if it's directly under the root."
+  (let* ((id-dir (directory-file-name (file-name-directory file)))
+         (container (file-name-directory id-dir))
+         (rel (file-relative-name container notation-directory)))
+    (unless (member rel '("./" "."))
+      (directory-file-name rel))))
 
 (defun notation--all-notes ()
   "Return an alist of (DISPLAY . FILE-PATH) for every existing note."
-  (let (result)
-    (dolist (dir (notation--note-dirs))
-      (let ((file (notation--main-file-in-dir dir)))
-        (when file
-          (let* ((id (file-name-nondirectory (directory-file-name dir)))
-                 (parsed (notation--parse-file-name file))
-                 (title (plist-get parsed :title))
-                 (tags (plist-get parsed :tags))
-                 (display (format "%s  %s%s"
-                                   id
-                                   title
-                                   (if tags
-                                       (format "  [%s]" (mapconcat #'identity tags " "))
-                                     ""))))
-            (push (cons display file) result)))))
-    (nreverse result)))
+  (thread-last
+    (notation--find-note-files)
+    (mapcar
+     (lambda (file)
+       (let* ((id (notation--id-from-file file))
+              (subdir (notation--subdir-from-file file))
+              (parsed (notation--parse-file-name file))
+              (title (plist-get parsed :title))
+              (tags (plist-get parsed :tags))
+              (keywords (plist-get parsed :keywords))
+              (display
+               (format "%s  %s%s%s%s"
+                       id
+                       (if subdir (format "%s/  " subdir) "")
+                       title
+                       (if tags (format "  [%s]" (mapconcat #'identity tags " ")) "")
+                       (if keywords (format "  {%s}" (mapconcat #'identity keywords " ")) ""))))
+         (cons display file))))
+    (sort (lambda (a b) (string> (car a) (car b))))))
 
-(defun notation--insert-front-matter (title tags)
-  "Insert denote-style front matter for TITLE and TAGS at point."
+(defun notation--insert-front-matter (title tags keywords)
+  "Insert denote-style front matter for TITLE, TAGS and KEYWORDS at point."
   (insert "#+title:      " title "\n")
   (insert "#+date:       " (format-time-string "%Y-%m-%d %H:%M") "\n")
-  (insert "#+filetags:   " (if tags
-                                (concat ":" (mapconcat #'identity tags ":") ":")
-                              "")
-          "\n\n"))
+  (insert "#+filetags:   " (if tags (concat ":" (mapconcat #'identity tags ":") ":") "") "\n")
+  (insert "#+keywords:   " (if keywords (mapconcat #'identity keywords " ") "") "\n\n"))
 
 ;;; Commands
 
 ;;;###autoload
-(defun notation-new-note (title tags)
-  "Create a new note titled TITLE with TAGS.
-TAGS is read as a comma/space separated string and split into slugs.
-Creates a new timestamped directory under `notation-directory',
-writes the main note file inside it, and opens it."
+(defun notation-new-note (title tags keywords subdir extension)
+  "Create a new note titled TITLE with TAGS and KEYWORDS.
+TAGS and KEYWORDS are read as comma/space separated strings and each
+split into bare tokens. SUBDIR, if non-empty, is a subdirectory path
+(relative to `notation-directory') the note's id directory is placed
+under, letting notes be organized arbitrarily. EXTENSION (without a
+leading dot) controls the main file's type -- org, md, pdf, ipynb,
+or anything else.
+
+Creates a new timestamped id directory, writes the main note file
+inside it, and opens it."
   (interactive
    (list (read-string "Title: ")
-         (read-string "Tags (comma/space separated, optional): ")))
+         (read-string "Tags (comma/space separated, optional): ")
+         (read-string "Keywords (comma/space separated, optional): ")
+         (read-string "Subdirectory (optional, e.g. projects/emacs): ")
+         (read-string (format "Extension (default %s): " notation-default-extension)
+                      nil nil notation-default-extension)))
   (when (string-empty-p (string-trim title))
     (user-error "Title must not be empty"))
   (let* ((id (notation--new-id))
-         (dir (expand-file-name id notation-directory))
-         (tag-list (notation--tags-to-list tags))
-         (file-name (notation--file-name title tag-list))
+         (base-dir (if (string-empty-p (string-trim subdir))
+                       notation-directory
+                     (expand-file-name (string-trim subdir) notation-directory)))
+         (dir (expand-file-name id base-dir))
+         (tag-list (notation--tokens-from-string tags))
+         (keyword-list (notation--tokens-from-string keywords))
+         (ext (string-trim (string-remove-prefix "." extension)))
+         (file-name (notation--file-name title tag-list keyword-list ext))
          (path (expand-file-name file-name dir)))
     (make-directory dir t)
     (find-file path)
-    (notation--insert-front-matter title tag-list)
+    (when (member ext '("org" "md" "markdown" "txt"))
+      (notation--insert-front-matter title tag-list keyword-list))
     (save-buffer)
     (message "Created note %s" id)))
 
 ;;;###autoload
 (defun notation-find-note ()
-  "Prompt for an existing note and open its main file."
+  "Prompt for an existing note (via ripgrep) and open its main file."
   (interactive)
   (let ((notes (notation--all-notes)))
     (unless notes
@@ -190,22 +303,24 @@ writes the main note file inside it, and opens it."
 ;;;###autoload
 (defun notation-rename-note ()
   "Rename the note file visited by the current buffer.
-Prompts for a new title and tags, keeping the note's directory
-(and therefore its id/timestamp) unchanged."
+Prompts for a new title, tags and keywords, keeping the note's
+directory (and therefore its id/timestamp and location) unchanged."
   (interactive)
   (let* ((file (buffer-file-name))
          (dir (and file (file-name-directory file))))
-    (unless (and file
-                 (string-match-p notation-id-regexp
-                                  (file-name-nondirectory
-                                   (directory-file-name dir))))
+    (unless (and file (notation--note-file-p file))
       (user-error "Current buffer is not visiting a notation note"))
     (let* ((parsed (notation--parse-file-name file))
-           (title (read-string "Title: " (plist-get parsed :title)))
+           (title (read-string "Title: "
+                                (replace-regexp-in-string "_" " " (plist-get parsed :title))))
            (tags (read-string "Tags: "
                                (mapconcat #'identity (plist-get parsed :tags) " ")))
-           (tag-list (notation--tags-to-list tags))
-           (new-name (notation--file-name title tag-list))
+           (keywords (read-string "Keywords: "
+                                   (mapconcat #'identity (plist-get parsed :keywords) " ")))
+           (tag-list (notation--tokens-from-string tags))
+           (keyword-list (notation--tokens-from-string keywords))
+           (ext (file-name-extension file))
+           (new-name (notation--file-name title tag-list keyword-list ext))
            (new-path (expand-file-name new-name dir)))
       (rename-file file new-path)
       (set-visited-file-name new-path t t)

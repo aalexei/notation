@@ -72,6 +72,15 @@
 ;; each day actually visited gets its own top-level heading, added on
 ;; demand rather than pre-created for the whole week.
 ;;
+;; For collecting TODOs, `notation-org-agenda' and
+;; `notation-org-todo-list' point Org's agenda at the note tree, but
+;; first use ripgrep to prefilter down to only the .org files that
+;; actually contain an open TODO (see
+;; `notation-org-agenda-todo-regexp'), including attachment .org
+;; files alongside a note's main file, not just main files -- so
+;; `org-agenda-files' never grows to include files Org would have to
+;; parse for nothing.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
@@ -83,6 +92,9 @@
 ;;   M-x notation-journal-today
 ;;   M-x notation-journal-forward
 ;;   M-x notation-journal-backward
+;;   M-x notation-org-agenda
+;;   M-x notation-org-todo-list
+;;   M-x notation-sync-org-agenda-files
 
 ;;; Code:
 
@@ -91,6 +103,9 @@
 
 (declare-function org-find-exact-headline-in-buffer "org")
 (declare-function org-end-of-subtree "org")
+(declare-function org-agenda "org-agenda")
+(declare-function org-todo-list "org-agenda")
+(defvar org-agenda-files)
 
 
 ;;; Customization
@@ -146,6 +161,16 @@ current week's note) only applies when the note is visited in
   "`format-time-string' format for a day's heading within a weekly
 journal note, e.g. \"2026-09-07 Monday\"."
   :type 'string
+  :group 'notation)
+
+(defcustom notation-org-agenda-todo-regexp "^\\*+ +TODO\\b"
+  "Regexp used to prefilter candidate files for the Org agenda.
+Ripgrep is run with this pattern over every .org file under
+`notation-directory' (not just note main files -- attachments count
+too); only files with at least one match are added to
+`org-agenda-files'. Customize this if you use additional or
+different TODO keywords (e.g. \"^\\\\*+ +\\\\(TODO\\\\|WAITING\\\\)\\\\b\")."
+  :type 'regexp
   :group 'notation)
 
 (defconst notation-id-regexp "\\`[0-9]\\{14\\}\\'"
@@ -818,6 +843,70 @@ otherwise relative to today."
    "notation"
    :follow (lambda (id &rest _) (find-file (notation-resolve-id id)))
    :face 'org-link))
+
+;;; Org agenda integration
+;;
+;; A note tree can accumulate far more .org files than actually have
+;; open work in them (attachments, reference material, journal
+;; entries long since closed out), and Org's agenda re-parses every
+;; file in `org-agenda-files' on each run -- so pointing it at the
+;; whole tree gets slow as the tree grows. Ripgrep is used as a cheap
+;; prefilter: only .org files it finds an open-TODO match in (per
+;; `notation-org-agenda-todo-regexp') are handed to Org at all.
+
+(defun notation--org-files-with-todos ()
+  "Return all .org files under `notation-directory' that ripgrep finds
+matching `notation-org-agenda-todo-regexp'. Every .org file in the
+tree is a candidate -- not just note main files -- since an
+attachment .org file living alongside a note can carry TODOs too."
+  (notation--ensure-root)
+  (notation--check-rg)
+  (let* ((default-directory notation-directory)
+         (output
+          (with-temp-buffer
+            (let ((status (call-process notation-rg-executable nil t nil
+                                         "--files-with-matches" "--hidden" "--no-messages"
+                                         "--no-ignore-vcs" "-g" "*.org"
+                                         notation-org-agenda-todo-regexp)))
+              (unless (memq status '(0 1))
+                (error "ripgrep failed: %s" (string-trim (buffer-string))))
+              (buffer-string)))))
+    (mapcar (lambda (rel) (expand-file-name rel notation-directory))
+            (split-string output "\n" t))))
+
+;;;###autoload
+(defun notation-sync-org-agenda-files ()
+  "Set `org-agenda-files' to .org files under `notation-directory'
+that ripgrep finds containing an open TODO (see
+`notation-org-agenda-todo-regexp'). Meant to be called right before
+opening the agenda -- see `notation-org-agenda' and
+`notation-org-todo-list', which do this automatically -- so files
+with no open work never reach Org's own (slower) parsing."
+  (interactive)
+  (let ((files (notation--org-files-with-todos)))
+    (setq org-agenda-files files)
+    (when (called-interactively-p 'interactive)
+      (message "notation: %d org file%s with open TODOs set as agenda files"
+                (length files) (if (= (length files) 1) "" "s")))
+    files))
+
+;;;###autoload
+(defun notation-org-agenda ()
+  "Sync `org-agenda-files' from the note tree, then open the Org
+agenda dispatcher (`org-agenda')."
+  (interactive)
+  (require 'org-agenda)
+  (notation-sync-org-agenda-files)
+  (call-interactively #'org-agenda))
+
+;;;###autoload
+(defun notation-org-todo-list ()
+  "Sync `org-agenda-files' from the note tree, then show the global
+Org TODO list (`org-todo-list')."
+  (interactive)
+  (require 'org-agenda)
+  (notation-sync-org-agenda-files)
+  (org-todo-list))
 
 (provide 'notation)
 ;;; notation.el ends here

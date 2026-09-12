@@ -81,7 +81,7 @@
   :group 'files
   :prefix "notation-")
 
-(defcustom notation-directory (expand-file-name "~/notes/")
+(defcustom notation-directory (expand-file-name "~/notation/")
   "Root directory holding all notes.
 Notes may be organized into arbitrary subdirectories underneath it."
   :type 'directory

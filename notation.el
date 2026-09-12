@@ -81,6 +81,13 @@
 ;; `org-agenda-files' never grows to include files Org would have to
 ;; parse for nothing.
 ;;
+;; To *create* a TODO without leaving whatever you're currently
+;; working on, `notation-journal-capture-template-entry' provides an
+;; `org-capture-templates' entry (add it yourself, or call
+;; `notation-journal-enable-capture-template' once) that files a new
+;; TODO as a child of today's day heading in today's journal note,
+;; creating the note and/or heading first if needed.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
@@ -92,6 +99,7 @@
 ;;   M-x notation-journal-today
 ;;   M-x notation-journal-forward
 ;;   M-x notation-journal-backward
+;;   M-x notation-journal-enable-capture-template
 ;;   M-x notation-org-agenda
 ;;   M-x notation-org-todo-list
 ;;   M-x notation-sync-org-agenda-files
@@ -105,6 +113,8 @@
 (declare-function org-end-of-subtree "org")
 (declare-function org-agenda "org-agenda")
 (declare-function org-todo-list "org-agenda")
+(declare-function org-capture-target-buffer "org-capture")
+(defvar org-capture-templates)
 (defvar org-agenda-files)
 
 
@@ -160,6 +170,12 @@ current week's note) only applies when the note is visited in
 (defcustom notation-journal-day-heading-format "%Y-%m-%d %A"
   "`format-time-string' format for a day's heading within a weekly
 journal note, e.g. \"2026-09-07 Monday\"."
+  :type 'string
+  :group 'notation)
+
+(defcustom notation-journal-capture-key "j"
+  "Key used in the ready-made entry from
+`notation-journal-capture-template-entry'."
   :type 'string
   :group 'notation)
 
@@ -835,6 +851,58 @@ Relative to the journal note in the current buffer, if there is one;
 otherwise relative to today."
   (interactive)
   (notation--journal-step -1))
+
+(defun notation-journal-capture-target ()
+  "Org-capture target: today's day heading in today's journal note.
+Ensures today's weekly journal note exists (creating it, its
+journal/<year>/ directory, and front matter if necessary), then
+moves point to the end of today's day heading's subtree, creating
+that heading too if it isn't there yet -- so a captured entry lands
+as a child of today's heading. Meant for use as a `(function ...)'
+target in `org-capture-templates' (see
+`notation-journal-capture-template-entry'), so a TODO can be filed
+into today's journal without switching away from whatever buffer
+you're currently working in until the capture is finished."
+  (require 'org-capture)
+  (let* ((time (current-time))
+         (path (notation--journal-ensure-note time)))
+    (set-buffer (org-capture-target-buffer path))
+    (unless (derived-mode-p 'org-mode)
+      (user-error "Journal capture needs `notation-journal-extension' to \
+produce an Org file, but %s is in %s" path major-mode))
+    (widen)
+    (notation--journal-goto-day time)))
+
+(defun notation-journal-capture-template-entry ()
+  "Return a ready-made `org-capture-templates' entry, keyed by
+`notation-journal-capture-key', that files a TODO as a child of
+today's day heading in today's journal note (see
+`notation-journal-capture-target'). The captured heading is created
+one level deeper than the day heading (\"**\"), so it nests under it
+rather than sitting alongside it.
+
+Splice it into your own capture templates, e.g.:
+
+  (with-eval-after-load \\='org-capture
+    (add-to-list \\='org-capture-templates
+                 (notation-journal-capture-template-entry)))
+
+or see `notation-journal-enable-capture-template' for a version of
+the above that also avoids adding a duplicate."
+  (list notation-journal-capture-key "TODO in today's journal" 'entry
+        '(function notation-journal-capture-target)
+        "** TODO %?"
+        :empty-lines 1))
+
+;;;###autoload
+(defun notation-journal-enable-capture-template ()
+  "Add `notation-journal-capture-template-entry' to
+`org-capture-templates', unless a template with the same key is
+already present. Safe to call more than once (e.g. from init.el)."
+  (require 'org-capture)
+  (let ((entry (notation-journal-capture-template-entry)))
+    (unless (assoc (car entry) org-capture-templates)
+      (setq org-capture-templates (append org-capture-templates (list entry))))))
 
 ;;; Org integration
 

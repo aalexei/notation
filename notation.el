@@ -242,6 +242,27 @@ the note lives under, or nil if it's directly under the root."
          (cons display file))))
     (sort (lambda (a b) (string> (car a) (car b))))))
 
+(defun notation--suggest-subdir ()
+  "Suggest a default subdirectory for a new note.
+If the current buffer is visiting a file under `notation-directory',
+suggest the filing path it lives under -- i.e. the same directory a
+sibling note would go in. If that file itself sits directly inside a
+note's own 14-digit id directory, that id directory is dropped from
+the suggestion, since a new note shouldn't be nested inside another
+note's directory. Returns nil (no suggestion) if the current buffer
+isn't inside `notation-directory' at all."
+  (let ((file (buffer-file-name)))
+    (when (and file (file-in-directory-p file notation-directory))
+      (let* ((dir (file-name-directory file))
+             (rel (file-relative-name dir notation-directory)))
+        (unless (member rel '("./" "." ""))
+          (let* ((rel (directory-file-name rel))
+                 (parts (split-string rel "/" t)))
+            (when (and parts (string-match-p notation-id-regexp (car (last parts))))
+              (setq parts (butlast parts)))
+            (when parts
+              (mapconcat #'identity parts "/"))))))))
+
 (defun notation--insert-front-matter (title tags keywords)
   "Insert denote-style front matter for TITLE, TAGS and KEYWORDS at point."
   (insert "#+title:      " title "\n")
@@ -257,9 +278,12 @@ the note lives under, or nil if it's directly under the root."
 TAGS and KEYWORDS are read as comma/space separated strings and each
 split into bare tokens. SUBDIR, if non-empty, is a subdirectory path
 (relative to `notation-directory') the note's id directory is placed
-under, letting notes be organized arbitrarily. EXTENSION (without a
-leading dot) controls the main file's type -- org, md, pdf, ipynb,
-or anything else.
+under, letting notes be organized arbitrarily. When invoked from a
+buffer already visiting a file under `notation-directory', SUBDIR is
+pre-filled with that file's filing directory, so creating a note
+while looking at a related one defaults to filing it alongside.
+EXTENSION (without a leading dot) controls the main file's type --
+org, md, pdf, ipynb, or anything else.
 
 Creates a new timestamped id directory, writes the main note file
 inside it, and opens it."
@@ -267,7 +291,8 @@ inside it, and opens it."
    (list (read-string "Title: ")
          (read-string "Tags (comma/space separated, optional): ")
          (read-string "Keywords (comma/space separated, optional): ")
-         (read-string "Subdirectory (optional, e.g. projects/emacs): ")
+         (read-string "Subdirectory (optional, e.g. projects/emacs): "
+                      (notation--suggest-subdir))
          (read-string (format "Extension (default %s): " notation-default-extension)
                       nil nil notation-default-extension)))
   (when (string-empty-p (string-trim title))

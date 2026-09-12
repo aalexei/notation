@@ -59,7 +59,8 @@
 ;; link type; anywhere else, `notation-follow-link-at-point' finds
 ;; and follows the "notation:ID" text near point directly. A note's
 ;; own directory must contain exactly one "__" file for a link to it
-;; to resolve; this is enforced at follow time.
+;; to resolve; this is enforced at follow time, and `notation-doctor'
+;; audits the whole tree for that (and other) invariant violations.
 ;;
 ;; Entry points:
 ;;   M-x notation-new-note
@@ -68,6 +69,7 @@
 ;;   M-x notation-insert-link
 ;;   M-x notation-follow-link-at-point
 ;;   M-x notation-backlinks
+;;   M-x notation-doctor
 
 ;;; Code:
 
@@ -235,25 +237,29 @@ the note lives under, or nil if it's directly under the root."
 
 (defun notation--all-notes ()
   "Return an alist of (DISPLAY . FILE-PATH) for every existing note."
-  (thread-last
-    (notation--find-note-files)
-    (mapcar
-     (lambda (file)
-       (let* ((id (notation--id-from-file file))
-              (subdir (notation--subdir-from-file file))
-              (parsed (notation--parse-file-name file))
-              (title (plist-get parsed :title))
-              (tags (plist-get parsed :tags))
-              (aliases (plist-get parsed :aliases))
-              (display
-               (format "%s  %s%s%s%s"
-                       id
-                       (if subdir (format "%s/  " subdir) "")
-                       title
-                       (if tags (format "  [%s]" (mapconcat #'identity tags " ")) "")
-                       (if aliases (format "  {%s}" (mapconcat #'identity aliases " ")) ""))))
-         (cons display file))))
-    (sort (lambda (a b) (string> (car a) (car b))))))
+  (let ((entries
+         (mapcar
+          (lambda (file)
+            (let* ((id (notation--id-from-file file))
+                   (subdir (notation--subdir-from-file file))
+                   (parsed (notation--parse-file-name file))
+                   (title (plist-get parsed :title))
+                   (tags (plist-get parsed :tags))
+                   (aliases (plist-get parsed :aliases))
+                   (display
+                    (format "%s  %s%s%s%s"
+                            id
+                            (if subdir (format "%s/  " subdir) "")
+                            title
+                            (if tags (format "  [%s]" (mapconcat #'identity tags " ")) "")
+                            (if aliases (format "  {%s}" (mapconcat #'identity aliases " ")) ""))))
+              (cons display file)))
+          (notation--find-note-files))))
+    ;; NOTE: deliberately not `thread-last' here -- `sort' takes
+    ;; (SEQUENCE PREDICATE), but `thread-last' appends the threaded
+    ;; value as the *last* argument of each form, which would call
+    ;; `sort' as (sort PREDICATE SEQUENCE) -- backwards.
+    (sort entries (lambda (a b) (string> (car a) (car b))))))
 
 ;;; Internal helpers: links
 
@@ -339,6 +345,37 @@ doesn't get treated as a backlink."
       (split-string output "\n" t)
       (mapcar (lambda (rel) (expand-file-name rel notation-directory)))
       (seq-filter #'notation--note-file-p))))
+
+(defun notation--all-id-dirs-with-files ()
+  "Return an alist of (ID-DIR . FILES) for every id-shaped directory.
+Unlike `notation--find-note-files', this lists *every* directory
+under `notation-directory' whose name matches `notation-id-regexp',
+along with everything it directly contains -- including directories
+that have no \"__\" file, or more than one -- so `notation-doctor'
+can detect problems that well-formed note discovery would otherwise
+just silently skip."
+  (notation--ensure-root)
+  (notation--check-rg)
+  (let* ((default-directory notation-directory)
+         (output
+          (with-temp-buffer
+            (let ((status (call-process notation-rg-executable nil t nil
+                                         "--files" "--hidden" "--no-messages"
+                                         "--no-ignore-vcs")))
+              (unless (memq status '(0 1))
+                (error "ripgrep failed: %s" (string-trim (buffer-string))))
+              (buffer-string))))
+         (files (mapcar (lambda (rel) (expand-file-name rel notation-directory))
+                         (split-string output "\n" t)))
+         (table (make-hash-table :test #'equal)))
+    (dolist (file files)
+      (let* ((dir (directory-file-name (file-name-directory file)))
+             (parent-name (file-name-nondirectory dir)))
+        (when (string-match-p notation-id-regexp parent-name)
+          (puthash dir (cons file (gethash dir table)) table))))
+    (let (result)
+      (maphash (lambda (dir dir-files) (push (cons dir dir-files) result)) table)
+      result)))
 
 (defun notation--suggest-subdir ()
   "Suggest a default subdirectory for a new note.
@@ -523,6 +560,62 @@ excluded since ripgrep only content-searches text."
                (choice (completing-read (format "Backlinks to %s: " id)
                                          (mapcar #'car alist) nil t)))
           (find-file (cdr (assoc choice alist)))))))))
+
+;;;###autoload
+(defun notation-doctor ()
+  "Audit all note directories under `notation-directory' for problems.
+Checks that every id-shaped directory contains exactly one \"__\"
+file -- the invariant that note discovery and link resolution both
+depend on -- and that no 14-digit id is reused across more than one
+directory. Results are shown in a `*notation-doctor*' buffer; if
+everything checks out, reports so in the echo area instead."
+  (interactive)
+  (let* ((id-dirs (notation--all-id-dirs-with-files))
+         (problems nil)
+         (id-locations (make-hash-table :test #'equal)))
+    (dolist (entry id-dirs)
+      (let* ((dir (car entry))
+             (files (cdr entry))
+             (main-files (seq-filter
+                          (lambda (f) (string-match-p notation-marker-regexp
+                                                       (file-name-nondirectory f)))
+                          files))
+             (id (file-name-nondirectory dir)))
+        (puthash id (cons dir (gethash id id-locations)) id-locations)
+        (cond
+         ((null main-files)
+          (push (format "%s -- no \"__\" file (invisible to note discovery)" dir)
+                problems))
+         ((cdr main-files)
+          (push (format "%s -- %d \"__\" files, expected exactly 1: %s"
+                        dir (length main-files)
+                        (mapconcat #'file-name-nondirectory main-files ", "))
+                problems)))))
+    (maphash
+     (lambda (id dirs)
+       (when (cdr dirs)
+         (push (format "id %s reused by %d directories: %s"
+                        id (length dirs) (mapconcat #'identity dirs ", "))
+               problems)))
+     id-locations)
+    (if (null problems)
+        (message "notation-doctor: checked %d note director%s under %s, no problems found"
+                  (length id-dirs) (if (= (length id-dirs) 1) "y" "ies")
+                  notation-directory)
+      (setq problems (nreverse problems))
+      (with-current-buffer (get-buffer-create "*notation-doctor*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "notation-doctor: %d problem%s found under %s\n\n"
+                           (length problems) (if (= (length problems) 1) "" "s")
+                           notation-directory))
+          (dolist (p problems)
+            (insert "- " p "\n")))
+        (goto-char (point-min))
+        (special-mode)
+        (display-buffer (current-buffer)))
+      (message "notation-doctor: %d problem%s found, see *notation-doctor*"
+                (length problems) (if (= (length problems) 1) "" "s")))))
 
 ;;; Org integration
 

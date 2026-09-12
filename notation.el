@@ -51,10 +51,23 @@
 ;; Emacs Lisp, so it stays fast even with deep or large note trees.
 ;; Ripgrep must be installed and on `exec-path'.
 ;;
+;; Notes can link to each other with a plain-text reference of the
+;; form "notation:ID" -- always the 14-digit id, never an alias,
+;; since aliases aren't guaranteed unique and a link has to resolve
+;; to exactly one note. Because the reference is plain text, it works
+;; the same way regardless of file type: Org gets a native, clickable
+;; link type; anywhere else, `notation-follow-link-at-point' finds
+;; and follows the "notation:ID" text near point directly. A note's
+;; own directory must contain exactly one "__" file for a link to it
+;; to resolve; this is enforced at follow time.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
 ;;   M-x notation-rename-note
+;;   M-x notation-insert-link
+;;   M-x notation-follow-link-at-point
+;;   M-x notation-backlinks
 
 ;;; Code:
 
@@ -242,6 +255,91 @@ the note lives under, or nil if it's directly under the root."
          (cons display file))))
     (sort (lambda (a b) (string> (car a) (car b))))))
 
+;;; Internal helpers: links
+
+(defun notation--files-for-id (id)
+  "Return the list of \"__\" files that live in a note directory named ID.
+Searched directly with ripgrep (rather than filtering the full note
+list), so resolving a single link stays cheap regardless of corpus
+size. Ordinarily this should be a list of exactly one file; anything
+else means the one-main-file-per-directory invariant is broken."
+  (notation--ensure-root)
+  (notation--check-rg)
+  (let* ((default-directory notation-directory)
+         (glob (format "**/%s/__*" id))
+         (output
+          (with-temp-buffer
+            (let ((status (call-process notation-rg-executable nil t nil
+                                         "--files" "--hidden" "--no-messages"
+                                         "--no-ignore-vcs"
+                                         "-g" glob)))
+              (unless (memq status '(0 1))
+                (error "ripgrep failed: %s" (string-trim (buffer-string))))
+              (buffer-string)))))
+    (thread-last
+      (split-string output "\n" t)
+      (mapcar (lambda (rel) (expand-file-name rel notation-directory))))))
+
+(defun notation-resolve-id (id)
+  "Return the absolute path of the note file whose directory is ID.
+Signals a `user-error' if ID isn't a valid id or no such note exists,
+or a hard `error' if ID's directory contains more than one \"__\"
+file, since that violates the one-main-file-per-note invariant a
+link's resolution depends on."
+  (unless (string-match-p notation-id-regexp id)
+    (user-error "\"%s\" is not a valid 14-digit note id" id))
+  (let ((files (notation--files-for-id id)))
+    (cond
+     ((null files) (user-error "No note found with id %s" id))
+     ((cdr files)
+      (error "Note directory %s contains multiple \"__\" files: %s"
+             id (mapconcat #'identity files ", ")))
+     (t (car files)))))
+
+(defun notation--link-id-at-point ()
+  "Return the id referenced by a \"notation:ID\" text near point, or nil.
+Scans the current line for occurrences of the pattern; if point
+falls inside one, that one wins, otherwise a single unambiguous match
+on the line is used as a fallback."
+  (save-excursion
+    (let ((line-end (line-end-position))
+          (pt (point))
+          (matches nil)
+          (contained nil))
+      (beginning-of-line)
+      (while (re-search-forward "notation:\\([0-9]\\{14\\}\\)" line-end t)
+        (let ((beg (match-beginning 0))
+              (end (match-end 0))
+              (id (match-string 1)))
+          (push id matches)
+          (when (and (<= beg pt) (<= pt end))
+            (setq contained id))))
+      (or contained
+          (and (= (length matches) 1) (car matches))))))
+
+(defun notation--search-text (needle)
+  "Return note main files under `notation-directory' containing NEEDLE.
+NEEDLE is matched literally (not as a regexp) via ripgrep's content
+search. Results are filtered down to actual note main files, so a
+stray match inside some other file (an attachment, a cache file)
+doesn't get treated as a backlink."
+  (notation--ensure-root)
+  (notation--check-rg)
+  (let* ((default-directory notation-directory)
+         (output
+          (with-temp-buffer
+            (let ((status (call-process notation-rg-executable nil t nil
+                                         "--files-with-matches" "--hidden" "--no-messages"
+                                         "--no-ignore-vcs" "--fixed-strings"
+                                         needle)))
+              (unless (memq status '(0 1))
+                (error "ripgrep failed: %s" (string-trim (buffer-string))))
+              (buffer-string)))))
+    (thread-last
+      (split-string output "\n" t)
+      (mapcar (lambda (rel) (expand-file-name rel notation-directory)))
+      (seq-filter #'notation--note-file-p))))
+
 (defun notation--suggest-subdir ()
   "Suggest a default subdirectory for a new note.
 If the current buffer is visiting a file under `notation-directory',
@@ -350,6 +448,89 @@ directory (and therefore its id/timestamp and location) unchanged."
       (rename-file file new-path)
       (set-visited-file-name new-path t t)
       (message "Renamed to %s" new-name))))
+
+;;;###autoload
+(defun notation-insert-link ()
+  "Search for a note and insert a link to it at point.
+The inserted link always encodes only the note's id -- never an
+alias, since aliases aren't guaranteed unique. Where the surrounding
+format supports a visible description, the note's title is used for
+that, purely for readability: it is never consulted when the link is
+later followed, so it can go stale harmlessly if the note is renamed.
+
+Link syntax adapts to the current major mode: a native Org link in
+Org buffers, Markdown link syntax in Markdown buffers, and a plain
+\"notation:ID (Title)\" form everywhere else."
+  (interactive)
+  (let ((notes (notation--all-notes)))
+    (unless notes
+      (user-error "No notes found in %s" notation-directory))
+    (let* ((choice (completing-read "Link to note: " (mapcar #'car notes) nil t))
+           (file (cdr (assoc choice notes)))
+           (id (notation--id-from-file file))
+           (parsed (notation--parse-file-name file))
+           (title (replace-regexp-in-string "_" " " (plist-get parsed :title))))
+      (insert
+       (cond
+        ((derived-mode-p 'org-mode)
+         (format "[[notation:%s][%s]]" id title))
+        ((derived-mode-p 'markdown-mode)
+         (format "[%s](notation:%s)" title id))
+        (t (format "notation:%s (%s)" id title)))))))
+
+;;;###autoload
+(defun notation-follow-link-at-point ()
+  "Open the note referenced by a \"notation:ID\" link at point.
+Works in any buffer or major mode, since the link is just text -- it
+finds the id near point directly rather than relying on a mode's own
+link-following machinery (Org links are additionally handled
+natively; see the \"notation\" link type registered below)."
+  (interactive)
+  (let ((id (notation--link-id-at-point)))
+    (unless id
+      (user-error "No notation link at point"))
+    (find-file (notation-resolve-id id))))
+
+;;;###autoload
+(defun notation-backlinks (&optional id)
+  "Show notes that link to the note with ID.
+With no ID and the current buffer visiting a note, uses that note's
+id; otherwise prompts for one. Backlinks are found by searching the
+whole `notation-directory' tree for the literal text \"notation:ID\"
+across note main files; binary files such as PDFs are naturally
+excluded since ripgrep only content-searches text."
+  (interactive)
+  (let* ((current-id (and (buffer-file-name)
+                           (notation--note-file-p (buffer-file-name))
+                           (notation--id-from-file (buffer-file-name))))
+         (id (or id current-id (read-string "Note id to find backlinks for: "))))
+    (unless (string-match-p notation-id-regexp id)
+      (user-error "\"%s\" is not a valid 14-digit note id" id))
+    (let* ((hits (notation--search-text (format "notation:%s" id)))
+           (hits (seq-remove (lambda (f) (string= (notation--id-from-file f) id)) hits)))
+      (cond
+       ((null hits) (message "No backlinks found for %s" id))
+       ((null (cdr hits)) (find-file (car hits)))
+       (t
+        (let* ((alist
+                (mapcar
+                 (lambda (f)
+                   (let* ((fid (notation--id-from-file f))
+                          (subdir (notation--subdir-from-file f))
+                          (title (plist-get (notation--parse-file-name f) :title)))
+                     (cons (format "%s  %s%s" fid (if subdir (format "%s/  " subdir) "") title) f)))
+                 hits))
+               (choice (completing-read (format "Backlinks to %s: " id)
+                                         (mapcar #'car alist) nil t)))
+          (find-file (cdr (assoc choice alist)))))))))
+
+;;; Org integration
+
+(with-eval-after-load 'org
+  (org-link-set-parameters
+   "notation"
+   :follow (lambda (id &rest _) (find-file (notation-resolve-id id)))
+   :face 'org-link))
 
 (provide 'notation)
 ;;; notation.el ends here

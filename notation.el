@@ -113,6 +113,7 @@
 (declare-function org-agenda "org-agenda")
 (declare-function org-todo-list "org-agenda")
 (declare-function org-capture-target-buffer "org-capture")
+(declare-function org-capture-put "org-capture")
 (defvar org-capture-templates)
 (defvar org-agenda-files)
 
@@ -849,18 +850,28 @@ otherwise relative to today."
   "Org-capture target: today's day heading in today's journal note.
 Ensures today's weekly journal note exists (creating it, its
 journal/<year>/ directory, and front matter if necessary), then
-moves point to the end of today's day heading's subtree, creating
-that heading too if it isn't there yet -- so a captured entry lands
-as a child of today's heading, rather than a sibling, if the
-template's own heading is written one star deeper (e.g. \"** TODO
-%?\" for a single-star day heading). Meant for use as a
-`(function ...)' target in your own `org-capture-templates', e.g.:
+moves point to today's day heading, creating that heading too if it
+isn't there yet, and marks the location via `:target-entry-p' so
+Org's own \"insert as a child of the current entry\" logic applies.
+
+That last part matters: a plain `(function ...)' capture target only
+tells Org where to put point -- unlike `file+headline' and similar
+target types, it does not by itself tell Org that position is
+\"inside an entry\". Without that, `org-capture-place-entry' falls
+back to inserting as a top-level heading and recomputes the level
+from context, ignoring whatever stars your template wrote. Setting
+`:target-entry-p' here means your template's own heading is properly
+filed as today's child regardless of how many stars it starts with
+-- a plain \"* TODO %?\" is enough.
+
+Meant for use as a `(function ...)' target in your own
+`org-capture-templates', e.g.:
 
   (with-eval-after-load \\='org-capture
     (add-to-list \\='org-capture-templates
                  \\='(\"j\" \"TODO in today's journal\" entry
                    (function notation-journal-capture-target)
-                   \"** TODO %?\" :empty-lines 1)))
+                   \"* TODO %?\" :empty-lines 1)))
 
 so a TODO can be filed into today's journal without switching away
 from whatever buffer you're currently working in until the capture
@@ -873,7 +884,8 @@ is finished."
       (user-error "Journal capture needs `notation-journal-extension' to \
 produce an Org file, but %s is in %s" path major-mode))
     (widen)
-    (notation--journal-goto-day time)))
+    (notation--journal-goto-day time)
+    (org-capture-put :target-entry-p t)))
 
 ;;; Org integration
 

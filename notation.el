@@ -326,26 +326,36 @@ the note lives under, or nil if it's directly under the root."
     (unless (member rel '("./" "."))
       (directory-file-name rel))))
 
-(defun notation--all-notes ()
-  "Return an alist of (DISPLAY . FILE-PATH) for every existing note."
+(defun notation--all-notes (&optional exclude-tags)
+  "Return an alist of (DISPLAY . FILE-PATH) for every existing note.
+DISPLAY includes the note's file extension, since notes can be any
+file type (org, md, pdf, ipynb, ...), not just Org. If EXCLUDE-TAGS
+is non-nil, notes carrying any tag in that list are left out
+entirely -- used by `notation-find-note' to hide journal notes."
   (let ((entries
-         (mapcar
-          (lambda (file)
-            (let* ((id (notation--id-from-file file))
-                   (subdir (notation--subdir-from-file file))
-                   (parsed (notation--parse-file-name file))
-                   (title (plist-get parsed :title))
-                   (tags (plist-get parsed :tags))
-                   (aliases (plist-get parsed :aliases))
-                   (display
-                    (format "%s  %s%s%s%s"
-                            id
-                            (if subdir (format "%s/  " subdir) "")
-                            title
-                            (if tags (format "  [%s]" (mapconcat #'identity tags " ")) "")
-                            (if aliases (format "  {%s}" (mapconcat #'identity aliases " ")) ""))))
-              (cons display file)))
-          (notation--find-note-files))))
+         (delq nil
+          (mapcar
+           (lambda (file)
+             (let* ((parsed (notation--parse-file-name file))
+                    (tags (plist-get parsed :tags)))
+               (unless (and exclude-tags (seq-intersection tags exclude-tags))
+                 (let* ((id (notation--id-from-file file))
+                        (subdir (notation--subdir-from-file file))
+                        (title (plist-get parsed :title))
+                        (aliases (plist-get parsed :aliases))
+                        (ext (file-name-extension file))
+                        (ext-part (if (and ext (not (string-empty-p ext)))
+                                      (concat "." ext) ""))
+                        (display
+                         (format "%s  %s%s%s%s%s"
+                                 id
+                                 (if subdir (format "%s/  " subdir) "")
+                                 title
+                                 ext-part
+                                 (if tags (format "  [%s]" (mapconcat #'identity tags " ")) "")
+                                 (if aliases (format "  {%s}" (mapconcat #'identity aliases " ")) ""))))
+                   (cons display file)))))
+           (notation--find-note-files)))))
     ;; NOTE: deliberately not `thread-last' here -- `sort' takes
     ;; (SEQUENCE PREDICATE), but `thread-last' appends the threaded
     ;; value as the *last* argument of each form, which would call
@@ -589,9 +599,14 @@ non-interactive equivalent."
 
 ;;;###autoload
 (defun notation-find-note ()
-  "Prompt for an existing note (via ripgrep) and open its main file."
+  "Prompt for an existing note (via ripgrep) and open its main file.
+Notes tagged with any of `notation-journal-tags' are left out of the
+list -- a journal note is just a week number and rarely useful to
+jump to directly; use `notation-journal-today',
+`notation-journal-forward', or `notation-journal-backward' for those
+instead."
   (interactive)
-  (let ((notes (notation--all-notes)))
+  (let ((notes (notation--all-notes notation-journal-tags)))
     (unless notes
       (user-error "No notes found in %s" notation-directory))
     (let* ((choice (completing-read "Note: " (mapcar #'car notes) nil t))

@@ -99,6 +99,9 @@
 ;; available) and renamed to notation's convention, with its content
 ;; left untouched.
 ;;
+;; `notation-consult-ripgrep' greps note content across the whole
+;; tree with live preview, via the `consult' package if installed.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
@@ -114,6 +117,7 @@
 ;;   M-x notation-org-todo-list
 ;;   M-x notation-sync-org-agenda-files
 ;;   M-x notation-dired-convert-to-note
+;;   M-x notation-consult-ripgrep
 
 ;;; Code:
 
@@ -127,6 +131,7 @@
 (declare-function org-capture-target-buffer "org-capture")
 (declare-function org-capture-put "org-capture")
 (declare-function dired-get-marked-files "dired")
+(declare-function consult-ripgrep "consult")
 (defvar org-capture-templates)
 (defvar org-agenda-files)
 
@@ -804,6 +809,26 @@ internal (double-dash) functions directly."
         (push file (gethash alias table))))
     (maphash (lambda (k v) (puthash k (nreverse v) table)) table)
     table))
+
+;;; Consult integration
+
+;;;###autoload
+(defun notation-consult-ripgrep ()
+  "Grep note content across `notation-directory' with live preview.
+Uses `consult-ripgrep', so results update as you type, and each
+candidate can be previewed and jumped to the same way any other
+Consult search works. Every file under the tree is searched --
+attachments included, not just note main files, consistent with how
+`notation-backlinks' and the Org-agenda TODO prefilter both treat
+note content generally rather than singling out main files.
+
+Requires the `consult' package. This uses consult's own `rg'
+invocation (`consult-ripgrep-args'), independent of
+`notation-rg-executable'."
+  (interactive)
+  (unless (require 'consult nil 'noerror)
+    (user-error "notation-consult-ripgrep requires the `consult' package"))
+  (consult-ripgrep notation-directory))
 
 ;;; Journal
 ;;

@@ -93,6 +93,12 @@
 ;; notes-source integration) to create notes and resolve aliases
 ;; without depending on notation's internal (double-dash) functions.
 ;;
+;; `notation-dired-convert-to-note' turns ordinary files sitting in a
+;; Dired buffer into notation notes in place, each getting its own
+;; new id directory (derived from the file's own creation time where
+;; available) and renamed to notation's convention, with its content
+;; left untouched.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
@@ -107,6 +113,7 @@
 ;;   M-x notation-org-agenda
 ;;   M-x notation-org-todo-list
 ;;   M-x notation-sync-org-agenda-files
+;;   M-x notation-dired-convert-to-note
 
 ;;; Code:
 
@@ -119,6 +126,7 @@
 (declare-function org-todo-list "org-agenda")
 (declare-function org-capture-target-buffer "org-capture")
 (declare-function org-capture-put "org-capture")
+(declare-function dired-get-marked-files "dired")
 (defvar org-capture-templates)
 (defvar org-agenda-files)
 
@@ -1027,6 +1035,107 @@ Org TODO list (`org-todo-list')."
   (require 'org-agenda)
   (notation-sync-org-agenda-files)
   (org-todo-list))
+
+;;; Dired integration
+;;
+;; Turn ordinary files sitting in a Dired buffer into notation notes
+;; in place: each file gets its own new id directory and is renamed
+;; into notation's own file-naming convention, with its content left
+;; completely untouched (no front matter is added -- these are
+;; existing files, not blank new notes).
+
+(defun notation--stat-time (file &rest args)
+  "Run \"stat ARGS FILE\", parse a single leading integer from its
+output as epoch seconds, and return it as an Emacs time value.
+Returns nil if `stat' isn't available, the call fails, or it reports
+zero (its convention for \"unknown\")."
+  (when (executable-find "stat")
+    (with-temp-buffer
+      (when (and (zerop (apply #'call-process "stat" nil t nil
+                                (append args (list file))))
+                 (progn (goto-char (point-min)) (looking-at "[0-9]+")))
+        (let ((secs (string-to-number (match-string 0))))
+          (unless (zerop secs)
+            (seconds-to-time secs)))))))
+
+(defun notation--file-birth-time (file)
+  "Return FILE's creation time as an Emacs time value, best-effort.
+Tries GNU coreutils' \"stat --format=%W\" (birth time, 0 if
+unknown), then BSD/macOS's \"stat -f %B\", then falls back to FILE's
+modification time if neither reports a real value -- true creation
+time isn't exposed by Emacs's own `file-attributes', and isn't
+tracked by every filesystem at all."
+  (or (notation--stat-time file "--format=%W")
+      (notation--stat-time file "-f" "%B")
+      (file-attribute-modification-time (file-attributes file))))
+
+(defun notation--unique-id-from-time (time)
+  "Return a 14-digit notation id derived from TIME, advancing by one
+second at a time until landing on an id not already used by any
+existing note directory -- so converting several files created
+within the same second doesn't collide."
+  (let ((id (format-time-string notation-id-format time)))
+    (while (notation--id-in-use-p id)
+      (setq time (time-add time 1))
+      (setq id (format-time-string notation-id-format time)))
+    id))
+
+(defun notation--dired-convert-one (file)
+  "Convert FILE into a new notation note in place.
+Prompts for a title (pre-filled with a sluggified version of FILE's
+own name), tags, aliases, and a subdirectory -- the same prompts
+`notation-new-note' uses. Creates a new id directory for FILE, using
+its creation time (see `notation--file-birth-time'), and moves FILE
+into it renamed to notation's own convention, preserving its
+original extension. Returns the new path."
+  (let* ((default-title (replace-regexp-in-string
+                          "_" " " (notation--slug (file-name-base file))))
+         (title (read-string (format "Title for %s: " (file-name-nondirectory file))
+                              default-title))
+         (tags (notation--tokens-from-string
+                (read-string "Tags (comma/space separated, optional): ")))
+         (aliases (notation--tokens-from-string
+                   (read-string "Aliases (comma/space separated, optional): ")))
+         (subdir (read-string "Subdirectory (optional, e.g. projects/emacs): "
+                               (notation--suggest-subdir)))
+         (ext (or (file-name-extension file) notation-default-extension))
+         (id (notation--unique-id-from-time (notation--file-birth-time file)))
+         (base-dir (if (string-empty-p (string-trim subdir))
+                       notation-directory
+                     (expand-file-name (string-trim subdir) notation-directory)))
+         (dir (expand-file-name id base-dir))
+         (dest (expand-file-name (notation--file-name title tags aliases ext) dir)))
+    (make-directory dir t)
+    (rename-file file dest)
+    dest))
+
+;;;###autoload
+(defun notation-dired-convert-to-note ()
+  "Convert the marked files (or the file at point) in the current
+Dired buffer into notation notes.
+For each file, prompts for a title (pre-filled with a sluggified
+version of the file's own name), tags, aliases and a subdirectory --
+the same prompts as `notation-new-note' -- then creates a new id
+directory for it and moves it there under notation's own naming
+convention. The file's own content is left untouched; no front
+matter is added.
+
+Each new id is derived from the file's own creation time where the
+filesystem exposes one, falling back to its modification time
+otherwise (see `notation--file-birth-time'), advancing by one second
+at a time until landing on an id not already in use."
+  (interactive)
+  (unless (derived-mode-p 'dired-mode)
+    (user-error "This command only works in a Dired buffer"))
+  (let ((files (dired-get-marked-files)))
+    (dolist (file files)
+      (when (file-directory-p file)
+        (user-error "%s is a directory; only files can be converted" file))
+      (notation--dired-convert-one file))
+    (revert-buffer)
+    (message "Converted %d file%s to notation note%s"
+              (length files) (if (= (length files) 1) "" "s")
+              (if (= (length files) 1) "" "s"))))
 
 (provide 'notation)
 ;;; notation.el ends here

@@ -88,6 +88,11 @@
 ;; TODO as a child of today's day heading in today's journal note,
 ;; creating the note and/or heading first if needed.
 ;;
+;; `notation-create-note' and `notation-all-aliases' are stable,
+;; non-interactive entry points meant for other code (e.g. a Citar
+;; notes-source integration) to create notes and resolve aliases
+;; without depending on notation's internal (double-dash) functions.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
@@ -515,6 +520,37 @@ Delegates to `notation-front-matter-function'."
 ;;; Commands
 
 ;;;###autoload
+(defun notation-create-note (title tags aliases subdir extension)
+  "Create a new note titled TITLE with TAGS and ALIASES (lists of bare
+tokens, possibly nil), under SUBDIR (a path relative to
+`notation-directory', or nil/empty for the root), with file
+EXTENSION (without a leading dot). Creates a new timestamped id
+directory, writes the main note file inside it (with front matter,
+for text-like extensions), visits it, and returns its path.
+
+This is the non-interactive core behind `notation-new-note'. Other
+code -- including other packages, e.g. a Citar notes-source that
+creates a note for a bibliography entry with the citekey as an alias
+-- can call it directly to create a note without going through
+`notation-new-note''s interactive prompts."
+  (when (string-empty-p (string-trim title))
+    (user-error "Title must not be empty"))
+  (let* ((id (notation--new-id))
+         (base-dir (if (or (null subdir) (string-empty-p (string-trim subdir)))
+                       notation-directory
+                     (expand-file-name (string-trim subdir) notation-directory)))
+         (dir (expand-file-name id base-dir))
+         (ext (string-trim (string-remove-prefix "." (or extension notation-default-extension))))
+         (file-name (notation--file-name title tags aliases ext))
+         (path (expand-file-name file-name dir)))
+    (make-directory dir t)
+    (find-file path)
+    (when (member ext '("org" "md" "markdown" "txt"))
+      (notation--insert-front-matter title tags aliases))
+    (save-buffer)
+    path))
+
+;;;###autoload
 (defun notation-new-note (title tags aliases subdir extension)
   "Create a new note titled TITLE with TAGS and ALIASES.
 TAGS and ALIASES are read as comma/space separated strings and each
@@ -528,7 +564,8 @@ EXTENSION (without a leading dot) controls the main file's type --
 org, md, pdf, ipynb, or anything else.
 
 Creates a new timestamped id directory, writes the main note file
-inside it, and opens it."
+inside it, and opens it. See `notation-create-note' for the
+non-interactive equivalent."
   (interactive
    (list (read-string "Title: ")
          (read-string "Tags (comma/space separated, optional): ")
@@ -537,24 +574,10 @@ inside it, and opens it."
                       (notation--suggest-subdir))
          (read-string (format "Extension (default %s): " notation-default-extension)
                       nil nil notation-default-extension)))
-  (when (string-empty-p (string-trim title))
-    (user-error "Title must not be empty"))
-  (let* ((id (notation--new-id))
-         (base-dir (if (string-empty-p (string-trim subdir))
-                       notation-directory
-                     (expand-file-name (string-trim subdir) notation-directory)))
-         (dir (expand-file-name id base-dir))
-         (tag-list (notation--tokens-from-string tags))
+  (let* ((tag-list (notation--tokens-from-string tags))
          (alias-list (notation--tokens-from-string aliases))
-         (ext (string-trim (string-remove-prefix "." extension)))
-         (file-name (notation--file-name title tag-list alias-list ext))
-         (path (expand-file-name file-name dir)))
-    (make-directory dir t)
-    (find-file path)
-    (when (member ext '("org" "md" "markdown" "txt"))
-      (notation--insert-front-matter title tag-list alias-list))
-    (save-buffer)
-    (message "Created note %s" id)))
+         (path (notation-create-note title tag-list alias-list subdir extension)))
+    (message "Created note %s" (notation--id-from-file path))))
 
 ;;;###autoload
 (defun notation-find-note ()
@@ -673,13 +696,17 @@ excluded since ripgrep only content-searches text."
   "Audit all note directories under `notation-directory' for problems.
 Checks that every id-shaped directory contains exactly one \"__\"
 file -- the invariant that note discovery and link resolution both
-depend on -- and that no 14-digit id is reused across more than one
-directory. Results are shown in a `*notation-doctor*' buffer; if
-everything checks out, reports so in the echo area instead."
+depend on -- that no 14-digit id is reused across more than one
+directory, and that no alias is reused across more than one note
+(aliases are meant to resolve unambiguously, e.g. a bibliography
+citekey stored as an alias). Results are shown in a
+`*notation-doctor*' buffer; if everything checks out, reports so in
+the echo area instead."
   (interactive)
   (let* ((id-dirs (notation--all-id-dirs-with-files))
          (problems nil)
-         (id-locations (make-hash-table :test #'equal)))
+         (id-locations (make-hash-table :test #'equal))
+         (alias-locations (make-hash-table :test #'equal)))
     (dolist (entry id-dirs)
       (let* ((dir (car entry))
              (files (cdr entry))
@@ -697,7 +724,11 @@ everything checks out, reports so in the echo area instead."
           (push (format "%s -- %d \"__\" files, expected exactly 1: %s"
                         dir (length main-files)
                         (mapconcat #'file-name-nondirectory main-files ", "))
-                problems)))))
+                problems))
+         (t
+          (dolist (alias (plist-get (notation--parse-file-name (car main-files)) :aliases))
+            (puthash alias (cons (car main-files) (gethash alias alias-locations))
+                     alias-locations))))))
     (maphash
      (lambda (id dirs)
        (when (cdr dirs)
@@ -705,6 +736,13 @@ everything checks out, reports so in the echo area instead."
                         id (length dirs) (mapconcat #'identity dirs ", "))
                problems)))
      id-locations)
+    (maphash
+     (lambda (alias files)
+       (when (cdr files)
+         (push (format "alias %s used by %d notes: %s"
+                        alias (length files) (mapconcat #'identity files ", "))
+               problems)))
+     alias-locations)
     (if (null problems)
         (message "notation-doctor: checked %d note director%s under %s, no problems found"
                   (length id-dirs) (if (= (length id-dirs) 1) "y" "ies")
@@ -723,6 +761,26 @@ everything checks out, reports so in the echo area instead."
         (display-buffer (current-buffer)))
       (message "notation-doctor: %d problem%s found, see *notation-doctor*"
                 (length problems) (if (= (length problems) 1) "" "s")))))
+
+;;;###autoload
+(defun notation-all-aliases ()
+  "Return a hash table mapping each alias to the note file(s) using it.
+Every alias found in any note's file name is included, keyed by the
+bare token as stored (see `notation--token'); each value is a list
+of files, almost always a single file if the corpus is
+well-formed -- see `notation-doctor', which flags any alias used by
+more than one note as a problem.
+
+Meant as a stable entry point for other code that needs to resolve
+some external identifier -- such as a bibliography citekey stored as
+a note's alias -- to its note, without depending on notation's
+internal (double-dash) functions directly."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (file (notation--find-note-files))
+      (dolist (alias (plist-get (notation--parse-file-name file) :aliases))
+        (push file (gethash alias table))))
+    (maphash (lambda (k v) (puthash k (nreverse v) table)) table)
+    table))
 
 ;;; Journal
 ;;

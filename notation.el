@@ -786,17 +786,28 @@ it (directory, file, and front matter) first if it doesn't exist."
               (insert (funcall notation-front-matter-function week-id notation-journal-tags nil))))
           path))))
 
-(defun notation--journal-goto-day (time)
-  "In the current Org buffer, move point to the heading for TIME's
-date, appending a new heading at the end of the buffer if it doesn't
-already exist."
+(defun notation--journal-day-heading-pos (time)
+  "Return the buffer position of TIME's day heading in the current
+Org buffer, creating that heading (appended at the end of the
+buffer) first if it doesn't already exist. Always returns the
+position at the very start of the heading's own line -- this matters
+for `notation-journal-capture-target', which needs Org's own
+`org-at-heading-p' check to succeed exactly there."
   (let* ((heading (format-time-string notation-journal-day-heading-format time))
          (pos (org-find-exact-headline-in-buffer heading)))
-    (if pos
-        (progn (goto-char pos) (org-end-of-subtree t t))
-      (goto-char (point-max))
-      (unless (bolp) (insert "\n"))
-      (insert "* " heading "\n"))))
+    (or pos
+        (progn
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n"))
+          (prog1 (point)
+            (insert "* " heading "\n"))))))
+
+(defun notation--journal-goto-day (time)
+  "Move point to the end of TIME's day heading's subtree in the
+current Org buffer, creating the heading first if necessary -- ready
+for typing a new entry directly under it."
+  (goto-char (notation--journal-day-heading-pos time))
+  (org-end-of-subtree t t))
 
 ;;;###autoload
 (defun notation-journal-today ()
@@ -850,19 +861,19 @@ otherwise relative to today."
   "Org-capture target: today's day heading in today's journal note.
 Ensures today's weekly journal note exists (creating it, its
 journal/<year>/ directory, and front matter if necessary), then
-moves point to today's day heading, creating that heading too if it
-isn't there yet, and marks the location via `:target-entry-p' so
-Org's own \"insert as a child of the current entry\" logic applies.
+leaves point exactly on today's day heading's own line (creating
+that heading too if it isn't there yet) and records that position
+via `:exact-position' together with `:target-entry-p', so Org's own
+\"insert as a child of the current entry\" logic applies.
 
-That last part matters: a plain `(function ...)' capture target only
-tells Org where to put point -- unlike `file+headline' and similar
-target types, it does not by itself tell Org that position is
-\"inside an entry\". Without that, `org-capture-place-entry' falls
-back to inserting as a top-level heading and recomputes the level
-from context, ignoring whatever stars your template wrote. Setting
-`:target-entry-p' here means your template's own heading is properly
-filed as today's child regardless of how many stars it starts with
--- a plain \"* TODO %?\" is enough.
+Both of those matter, and in this exact shape: `org-capture-place-entry'\\='s
+:target-entry-p branch checks `org-at-heading-p' at :exact-position
+with no fallback search, and only afterwards moves point itself (via
+`org-end-of-subtree') to work out where to insert. So point has to
+land precisely on the heading line -- not past it, not at the end of
+its subtree -- or the check fails and Org silently falls back to
+treating the entry as top-level, ignoring however many stars the
+template itself starts with.
 
 Meant for use as a `(function ...)' target in your own
 `org-capture-templates', e.g.:
@@ -884,8 +895,8 @@ is finished."
       (user-error "Journal capture needs `notation-journal-extension' to \
 produce an Org file, but %s is in %s" path major-mode))
     (widen)
-    (notation--journal-goto-day time)
-    (org-capture-put :target-entry-p t)))
+    (goto-char (notation--journal-day-heading-pos time))
+    (org-capture-put :exact-position (point) :target-entry-p t)))
 
 ;;; Org integration
 

@@ -196,9 +196,17 @@ journal note, e.g. \"2026-09-07 Monday\"."
 Ripgrep is run with this pattern over every .org file under
 `notation-directory' (not just note main files -- attachments count
 too); only files with at least one match are added to
-`org-agenda-files'. Customize this if you use additional or
-different TODO keywords (e.g. \"^\\\\*+ +\\\\(TODO\\\\|WAITING\\\\)\\\\b\")."
-  :type 'regexp
+`org-agenda-files'.
+
+IMPORTANT: this is matched by ripgrep itself, not by Emacs, so it
+must use Rust-regex syntax, not Emacs-Lisp regex syntax -- grouping
+and alternation are written unescaped, e.g. \"(TODO|WAITING)\", not
+Emacs's \"\\\\(TODO\\\\|WAITING\\\\)\". The default value above happens
+to be valid in both dialects (no grouping or alternation involved),
+which is easy to miss when customizing this for the first time.
+Customize this if you use additional or different TODO keywords,
+e.g. \"^\\\\*+ +(TODO|WAITING)\\\\b\"."
+  :type 'string
   :group 'notation)
 
 (defconst notation-id-regexp "\\`[0-9]\\{14\\}\\'"
@@ -251,9 +259,18 @@ different TODO keywords (e.g. \"^\\\\*+ +\\\\(TODO\\\\|WAITING\\\\)\\\\b\")."
 
 (defun notation--file-name (title tags aliases extension)
   "Build a note file name from TITLE, TAGS, ALIASES and EXTENSION.
-TAGS and ALIASES are lists of bare tokens (see `notation--token').
-EXTENSION is given without a leading dot."
+TAGS and ALIASES should already be lists of bare tokens (see
+`notation--token'), but are re-sanitized through it here regardless
+-- title is always safe by construction, since it always goes
+through `notation--slug', but tags and aliases previously weren't
+re-checked at this layer, so a caller that skipped
+`notation--tokens-from-string' (any non-interactive caller, e.g. an
+external package creating a note programmatically) could inject
+characters like \"/\" straight into the file name. EXTENSION is
+given without a leading dot."
   (let* ((slug (notation--slug title))
+         (tags (delete "" (mapcar #'notation--token tags)))
+         (aliases (delete "" (mapcar #'notation--token aliases)))
          (tag-part (if tags (concat "--" (mapconcat #'identity tags "-")) ""))
          (alias-part (if aliases (concat "==" (mapconcat #'identity aliases "=")) "")))
     (concat "__" slug tag-part alias-part "." extension)))
@@ -926,6 +943,11 @@ doesn't already exist."
   (let ((time (current-time)))
     (find-file (notation--journal-ensure-note time))
     (when (derived-mode-p 'org-mode)
+      ;; If this buffer was left narrowed from earlier editing (e.g.
+      ;; `org-narrow-to-subtree'), the heading search below would
+      ;; only see the narrowed region -- possibly missing an
+      ;; already-existing day heading and inserting a duplicate.
+      (widen)
       (notation--journal-goto-day time))))
 
 (defun notation--journal-step (direction)
@@ -1168,9 +1190,14 @@ at a time until landing on an id not already in use."
   (unless (derived-mode-p 'dired-mode)
     (user-error "This command only works in a Dired buffer"))
   (let ((files (dired-get-marked-files)))
+    ;; Validate every file before converting any of them, so a bad
+    ;; entry partway through a multi-file selection can't leave some
+    ;; files already converted and others untouched with no
+    ;; indication of where things stopped.
     (dolist (file files)
       (when (file-directory-p file)
-        (user-error "%s is a directory; only files can be converted" file))
+        (user-error "%s is a directory; only files can be converted" file)))
+    (dolist (file files)
       (notation--dired-convert-one file))
     (revert-buffer)
     (message "Converted %d file%s to notation note%s"

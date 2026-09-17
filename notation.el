@@ -316,9 +316,12 @@ directory, which is what actually makes something a note."
          (output
           (with-temp-buffer
             (let ((status (call-process notation-rg-executable nil t nil
-                                         "--files" "--hidden" "--no-messages"
-                                         "--no-ignore-vcs"
-                                         "-g" "__*")))
+                                        "--files"
+					;; "--hidden"
+					"--no-messages"
+                                        "--no-ignore-vcs"
+					"--sortr" "modified"
+                                        "-g" "__*")))
               ;; rg exits 1 when it simply found nothing; only treat
               ;; other non-zero statuses as real errors.
               (unless (memq status '(0 1))

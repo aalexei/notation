@@ -127,7 +127,6 @@
 (require 'seq)
 (require 'subr-x)
 
-(declare-function org-find-exact-headline-in-buffer "org")
 (declare-function org-end-of-subtree "org")
 (declare-function org-agenda "org-agenda")
 (declare-function org-todo-list "org-agenda")
@@ -931,24 +930,32 @@ inside `notation-journal-subdir'."
 
 (defun notation--journal-all-notes ()
   "Return an alist of (WEEK-SLUG . FILE) for every journal note,
-sorted chronologically (oldest first). WEEK-SLUG is the note's
-title as stored in its file name -- already in the same slug form
-produced by `notation--slug', which sorts lexicographically in the
-same order as the underlying dates since ISO week ids are
-zero-padded."
+sorted chronologically (oldest first). WEEK-SLUG is the note's title
+as stored in its file name, downcased -- `notation--slug' (used to
+build the lookup key on the other side of any comparison against
+this) always produces a lowercase slug, but a file's actual on-disk
+casing isn't guaranteed to match that, e.g. from a tool other than
+notation.el itself writing \"2026_W38\" instead of \"2026_w38\".
+Downcasing here means such a mismatch is never mistaken for a
+different week and duplicated. Aside from the downcasing, this is
+still in the same slug form `notation--slug' produces, which sorts
+lexicographically in the same order as the underlying dates since
+ISO week ids are zero-padded."
   (let (result)
     (dolist (file (notation--find-note-files))
       (when (notation--journal-subdir-p (notation--subdir-from-file file))
-        (push (cons (plist-get (notation--parse-file-name file) :title) file) result)))
+        (push (cons (downcase (plist-get (notation--parse-file-name file) :title)) file)
+              result)))
     (sort result (lambda (a b) (string< (car a) (car b))))))
 
 (defun notation--journal-current-week-slug ()
-  "Return the week-slug of the journal note visited by the current
-buffer, or nil if the current buffer isn't visiting one."
+  "Return the (downcased) week-slug of the journal note visited by the
+current buffer, or nil if the current buffer isn't visiting one. See
+`notation--journal-all-notes' for why this is downcased."
   (let ((file (buffer-file-name)))
     (when (and file (notation--note-file-p file)
                (notation--journal-subdir-p (notation--subdir-from-file file)))
-      (plist-get (notation--parse-file-name file) :title))))
+      (downcase (plist-get (notation--parse-file-name file) :title)))))
 
 (defun notation--journal-ensure-note (time)
   "Return the path to the journal note for TIME's ISO week, creating
@@ -968,21 +975,46 @@ it (directory, file, and front matter) first if it doesn't exist."
               (insert (funcall notation-front-matter-function week-id notation-journal-tags nil))))
           path))))
 
+(defun notation--journal-find-day-heading (time)
+  "Return the buffer position of the first level-1 Org heading in the
+current buffer whose text contains TIME's plain \"YYYY-MM-DD\" date,
+or nil if there is none.
+
+Matching only requires that date substring to be present -- nothing
+else about the heading's text (a weekday name, a TODO keyword, tags,
+anything else appended to it) affects whether it matches. This
+matters because a heading is otherwise easy to mismatch for reasons
+that have nothing to do with which day it actually represents: a
+weekday name is locale-dependent, so a heading written under one
+locale (by Emacs itself, or by some external tool -- e.g. a
+migration script that only ever produces English weekday names) can
+silently fail an exact-string match under a different one, leading
+to a duplicate heading being created for a day that already has one."
+  (let ((date-string (format-time-string "%Y-%m-%d" time)))
+    (save-excursion
+      (goto-char (point-min))
+      (catch 'found
+        (while (re-search-forward "^\\* .*$" nil t)
+          (when (string-match-p (regexp-quote date-string) (match-string 0))
+            (throw 'found (match-beginning 0))))
+        nil))))
+
 (defun notation--journal-day-heading-pos (time)
   "Return the buffer position of TIME's day heading in the current
 Org buffer, creating that heading (appended at the end of the
-buffer) first if it doesn't already exist. Always returns the
-position at the very start of the heading's own line -- this matters
-for `notation-journal-capture-target', which needs Org's own
-`org-at-heading-p' check to succeed exactly there."
-  (let* ((heading (format-time-string notation-journal-day-heading-format time))
-         (pos (org-find-exact-headline-in-buffer heading)))
-    (or pos
-        (progn
-          (goto-char (point-max))
-          (unless (bolp) (insert "\n"))
-          (prog1 (point)
-            (insert "* " heading "\n"))))))
+buffer) first if it doesn't already exist -- see
+`notation--journal-find-day-heading' for how an existing one is
+recognized. A newly created heading still uses the full
+`notation-journal-day-heading-format' for its own text. Always
+returns the position at the very start of the heading's own line --
+this matters for `notation-journal-capture-target', which needs
+Org's own `org-at-heading-p' check to succeed exactly there."
+  (or (notation--journal-find-day-heading time)
+      (let ((heading (format-time-string notation-journal-day-heading-format time)))
+        (goto-char (point-max))
+        (unless (bolp) (insert "\n"))
+        (prog1 (point)
+          (insert "* " heading "\n")))))
 
 (defun notation--journal-goto-day (time)
   "Move point to the end of TIME's day heading's subtree in the

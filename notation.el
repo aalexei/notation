@@ -1,7 +1,7 @@
 ;;; notation.el --- Computable, denote-like notes, one directory per note -*- lexical-binding: t; -*-
 
 ;; Author: You
-;; Version: 0.2
+;; Version: 0.3
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: outlines, files, convenience
 
@@ -20,18 +20,6 @@
 ;; This means notes can be filed into arbitrary subdirectories of
 ;; `notation-directory' (by topic, by project, however you like)
 ;; without breaking discovery.
-;;
-;; Layout example:
-;;
-;;   notation-directory/
-;;     projects/emacs/
-;;       20260910143022/
-;;         __config_notes--emacs==wip=urgent.org
-;;     journal/2026/
-;;       20260911090000/
-;;         __morning_pages.md
-;;     20260912101500/
-;;       __scan_of_receipt.pdf
 ;;
 ;; File name anatomy: __TITLE[--TAG1-TAG2...][==ALIAS1=ALIAS2...].EXT
 ;;
@@ -71,7 +59,7 @@
 ;;
 ;; A journal is built on the same note structure: each ISO week gets
 ;; one ordinary note, filed under journal/<ISO-week-year>/ and titled
-;; with its week id (e.g. "2026-W37"). Within an Org journal note,
+;; with its week id (e.g. "2026-w37"). Within an Org journal note,
 ;; each day actually visited gets its own top-level heading, added on
 ;; demand rather than pre-created for the whole week.
 ;;

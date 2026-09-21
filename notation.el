@@ -1,7 +1,7 @@
 ;;; notation.el --- Computable, denote-like notes, one directory per note -*- lexical-binding: t; -*-
 
 ;; Author: You
-;; Version: 0.3
+;; Version: 0.3.1
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: outlines, files, convenience
 

@@ -1,7 +1,7 @@
 ;;; notation.el --- Computable, denote-like notes, one directory per note -*- lexical-binding: t; -*-
 
 ;; Author: You
-;; Version: 0.3.1
+;; Version: 0.3.2
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: outlines, files, convenience
 
@@ -204,6 +204,15 @@ e.g. \"^\\\\*+ +(TODO|WAITING)\\\\b\"."
 
 (defconst notation-marker-regexp "\\`__"
   "Regexp matching the leading marker of a note's main file name.")
+
+(defcustom notation-journal-face-heights '((org-level-1 . 1.5) (org-document-title . 1.8))
+  "Faces to enlarge, buffer-locally, in journal notes.
+Each entry is (FACE . HEIGHT), where HEIGHT is relative to the face's
+normal height (1.5 means 50% larger). Only journal notes are affected;
+other Org buffers keep the normal faces. Add e.g. (org-level-1 . 1.4)
+to also enlarge the per-day headings."
+  :type '(alist :key-type face :value-type number)
+  :group 'notation)
 
 ;;; Internal helpers: ids, slugs, file names
 
@@ -1104,6 +1113,27 @@ produce an Org file, but %s is in %s" path major-mode))
     (widen)
     (goto-char (notation--journal-day-heading-pos time))
     (org-capture-put :exact-position (point) :target-entry-p t)))
+
+
+(defun notation--journal-buffer-p ()
+  "Non-nil if the current buffer visits a journal note.
+That means a notation note carrying any tag in `notation-journal-tags',
+compared case-insensitively."
+  (let ((file (buffer-file-name)))
+    (and file
+         (notation--note-file-p file)
+         (seq-intersection
+          (mapcar #'downcase (plist-get (notation--parse-file-name file) :tags))
+          (mapcar #'downcase notation-journal-tags)))))
+
+(defun notation--journal-apply-faces ()
+  "Enlarge `notation-journal-face-heights' faces in journal notes."
+  (when (and (derived-mode-p 'org-mode) (notation--journal-buffer-p))
+    (dolist (entry notation-journal-face-heights)
+      (face-remap-add-relative (car entry) :height (cdr entry)))))
+
+(add-hook 'org-mode-hook #'notation--journal-apply-faces)
+
 
 ;;; Org integration
 

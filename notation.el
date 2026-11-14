@@ -116,6 +116,7 @@
 (require 'subr-x)
 
 (declare-function org-end-of-subtree "org")
+(declare-function org-link-set-parameters "ol")
 (declare-function org-agenda "org-agenda")
 (declare-function org-todo-list "org-agenda")
 (declare-function org-capture-target-buffer "org-capture")

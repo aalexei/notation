@@ -229,7 +229,7 @@ to also enlarge the per-day headings."
     ;; Uniqueness only needs to hold within the target directory, but
     ;; checking globally is simpler and the collision is already rare.
     (while (notation--id-in-use-p id)
-      (sleep-for 0 1000) ;; wait 1s
+      (sleep-for 1)
       (setq id (format-time-string notation-id-format)))
     id))
 
@@ -284,12 +284,20 @@ given without a leading dot."
     ;; "==" (alias marker) and "--" (tag marker) can each only occur
     ;; once, as markers -- title/tag/alias tokens never contain "="
     ;; or "-" themselves -- so a single search for each is unambiguous.
+    ;; The marker position is captured before calling `split-string',
+    ;; which runs its own searches and clobbers the match data: reading
+    ;; (match-beginning 0) afterwards truncated titles whenever there was
+    ;; more than one tag or alias.
     (when (string-match "==\\(.+\\)\\'" body)
-      (setq aliases (split-string (match-string 1 body) "=" t))
-      (setq body (substring body 0 (match-beginning 0))))
+      (let ((start (match-beginning 0))
+            (value (match-string 1 body)))
+        (setq aliases (split-string value "=" t))
+        (setq body (substring body 0 start))))
     (when (string-match "--\\(.+\\)\\'" body)
-      (setq tags (split-string (match-string 1 body) "-" t))
-      (setq body (substring body 0 (match-beginning 0))))
+      (let ((start (match-beginning 0))
+            (value (match-string 1 body)))
+        (setq tags (split-string value "-" t))
+        (setq body (substring body 0 start))))
     (setq title body)
     (list :title title :tags tags :aliases aliases)))
 

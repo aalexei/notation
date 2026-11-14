@@ -362,7 +362,10 @@ the note lives under, or nil if it's directly under the root."
 (defun notation--all-notes (&optional exclude-tags)
   "Return an alist of (DISPLAY . FILE-PATH) for every existing note.
 DISPLAY includes the note's file extension, since notes can be any
-file type (org, md, pdf, ipynb, ...), not just Org. If EXCLUDE-TAGS
+file type (org, md, pdf, ipynb, ...), not just Org. Each tag is
+shown prefixed with \"-\" and each alias with \"=\" (\"-tag1 -tag2
+=alias1\"), so typing e.g. \"-proj\" or \"=abbr\" in the completion
+prompt filters by tag or alias rather than by title. If EXCLUDE-TAGS
 is non-nil, notes carrying any tag in that list are left out
 entirely -- used by `notation-find-note' to hide journal notes."
   (let ((entries
@@ -385,8 +388,8 @@ entirely -- used by `notation-find-note' to hide journal notes."
                                  (if subdir (format "%s/  " subdir) "")
                                  title
                                  ext-part
-                                 (if tags (format "  [%s]" (mapconcat #'identity tags " ")) "")
-                                 (if aliases (format "  {%s}" (mapconcat #'identity aliases " ")) ""))))
+                                 (if tags (concat "  " (mapconcat (lambda (tag) (concat "-" tag)) tags " ")) "")
+                                 (if aliases (concat "  " (mapconcat (lambda (alias) (concat "=" alias)) aliases " ")) ""))))
                    (cons display file)))))
            (notation--find-note-files)))))
     ;; NOTE: deliberately not `thread-last' here -- `sort' takes

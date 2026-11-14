@@ -93,6 +93,19 @@
 ;; `notation-consult-ripgrep' greps note content across the whole
 ;; tree with live preview, via the `consult' package if installed.
 ;;
+;; An Org dynamic block lists notes matching a query and keeps the
+;; list current on update (C-c C-c on its #+BEGIN line):
+;;
+;;   #+BEGIN: notation :search "-project" :since 2026 :sort title
+;;   #+END:
+;;
+;; It can select by name, subdirectory, extension, creation date,
+;; content, and links to or from a note (`this' for the note the block
+;; is in), and render a list, a table or bare ids, optionally grouped.
+;; See `notation-query' and `org-dblock-write:notation'; insert one
+;; with C-c C-x x notation. `notation-query' itself is a stable entry
+;; point for other code wanting the same selection.
+;;
 ;; Entry points:
 ;;   M-x notation-new-note
 ;;   M-x notation-find-note
@@ -117,6 +130,11 @@
 
 (declare-function org-end-of-subtree "org")
 (declare-function org-link-set-parameters "ol")
+(declare-function org-dynamic-block-define "org")
+(declare-function org-create-dblock "org")
+(declare-function org-update-dblock "org")
+(declare-function org-table-align "org-table")
+(declare-function org-table-end "org-table")
 (declare-function org-agenda "org-agenda")
 (declare-function org-todo-list "org-agenda")
 (declare-function org-capture-target-buffer "org-capture")
@@ -460,21 +478,40 @@ on the line is used as a fallback."
       (or contained
           (and (= (length matches) 1) (car matches))))))
 
-(defun notation--search-text (needle)
+(defun notation--search-text (needle &optional files)
   "Return note main files under `notation-directory' containing NEEDLE.
 NEEDLE is matched literally (not as a regexp) via ripgrep's content
 search. Results are filtered down to actual note main files, so a
 stray match inside some other file (an attachment, a cache file)
-doesn't get treated as a backlink."
+doesn't get treated as a backlink. With FILES, only those files are
+searched (see `notation--grep-files' for a regexp search)."
+  (notation--rg-files-with-matches (list "--fixed-strings" "-e" needle) files))
+
+(defun notation--grep-files (regexp &optional files)
+  "Return note main files whose content matches REGEXP.
+REGEXP uses ripgrep's (Rust) regex syntax, and is case-insensitive
+unless it contains an uppercase letter. With FILES, only those files
+are searched; otherwise the whole tree is."
+  (notation--rg-files-with-matches (list "--smart-case" "-e" regexp) files))
+
+(defun notation--rg-files-with-matches (args &optional files)
+  "Run ripgrep with ARGS and return the note main files that match.
+With FILES (absolute paths), search only those, which keeps a
+content filter cheap after cheaper filters have narrowed the
+candidates; otherwise search the whole tree."
   (notation--ensure-root)
   (notation--check-rg)
   (let* ((default-directory notation-directory)
          (output
           (with-temp-buffer
-            (let ((status (call-process notation-rg-executable nil t nil
-                                         "--files-with-matches" "--hidden" "--no-messages"
-                                         "--no-ignore-vcs" "--fixed-strings"
-                                         needle)))
+            (let ((status (apply #'call-process notation-rg-executable nil t nil
+                                 "--files-with-matches" "--hidden" "--no-messages"
+                                 "--no-ignore-vcs"
+                                 (append args
+                                         (when files
+                                           (cons "--" (mapcar (lambda (f)
+                                                                (file-relative-name f notation-directory))
+                                                              files)))))))
               (unless (memq status '(0 1))
                 (error "ripgrep failed: %s" (string-trim (buffer-string))))
               (buffer-string)))))
@@ -1147,13 +1184,366 @@ compared case-insensitively."
 (add-hook 'org-mode-hook #'notation--journal-apply-faces)
 
 
+;;; Queries
+
+(defun notation--note-plist (file)
+  "Return a plist describing the note whose main file is FILE.
+Keys: :id, :file, :name (the file name without the \"__\" marker or
+extension, i.e. \"title--tags==aliases\"), :title, :tags, :aliases,
+:subdir (nil at the root), :ext and :modified (a Lisp timestamp)."
+  (let* ((parsed (notation--parse-file-name file))
+         (base (file-name-base file)))
+    (list :id (notation--id-from-file file)
+          :file file
+          :name (if (string-match notation-marker-regexp base)
+                    (substring base (match-end 0))
+                  base)
+          :title (plist-get parsed :title)
+          :tags (plist-get parsed :tags)
+          :aliases (plist-get parsed :aliases)
+          :subdir (notation--subdir-from-file file)
+          :ext (or (file-name-extension file) "")
+          :modified (file-attribute-modification-time (file-attributes file)))))
+
+(defun notation--id-date (id)
+  "Return ID's date as \"YYYY-MM-DD\"."
+  (format "%s-%s-%s" (substring id 0 4) (substring id 4 6) (substring id 6 8)))
+
+(defun notation--as-strings (value)
+  "Return VALUE as a list of strings.
+VALUE may be a string, symbol or number, or a list of those -- the
+shapes Org's dynamic block parameters can take, e.g. `:ext pdf' or
+`:ext (\"org\" md)'."
+  (mapcar (lambda (v) (format "%s" v))
+          (if (listp value) value (list value))))
+
+(defun notation--query-bound (spec upper)
+  "Turn date SPEC into a 14-digit id-like string to compare ids against.
+SPEC is a date or date prefix -- \"2026\", \"2026-03\", \"2026-03-14\",
+or a full or partial id -- or a relative date \"-Nd\", \"-Nw\", \"-Nm\"
+or \"-Ny\" (N days, weeks, months or years ago). A partial date is
+padded to its start, or to its end if UPPER is non-nil, so both
+`:since' and `:until' include the whole period they name."
+  (let ((spec (format "%s" spec)))
+    (cond
+     ((string-match "\\`-\\([0-9]+\\)\\([dwmy]\\)\\'" spec)
+      (let ((n (string-to-number (match-string 1 spec)))
+            (unit (match-string 2 spec))
+            (time (decode-time)))
+        (pcase unit
+          ("d" (setf (decoded-time-day time) (- (decoded-time-day time) n)))
+          ("w" (setf (decoded-time-day time) (- (decoded-time-day time) (* 7 n))))
+          ("m" (setf (decoded-time-month time) (- (decoded-time-month time) n)))
+          ("y" (setf (decoded-time-year time) (- (decoded-time-year time) n))))
+        (format-time-string notation-id-format (encode-time time))))
+     (t
+      (let ((digits (replace-regexp-in-string "[-: T/]" "" spec)))
+        (unless (and (string-match-p "\\`[0-9]+\\'" digits)
+                     (<= 4 (length digits) 14)
+                     (zerop (% (length digits) 2)))
+          (user-error "Can't read %S as a date; use e.g. 2026-03, 2026-03-14 or -30d" spec))
+        (concat digits (make-string (- 14 (length digits)) (if upper ?9 ?0))))))))
+
+(defconst notation--query-sorts '(id title modified subdir)
+  "Sort orders accepted by `notation-query'.")
+
+;;;###autoload
+(defun notation-query (&rest params)
+  "Return the notes matching PARAMS, as plists (see `notation--note-plist').
+PARAMS is a keyword plist; every key is optional:
+
+  :search REGEXP    Emacs regexp matched (case-insensitively) against
+                    the note's name: title, tags and aliases as they
+                    appear in the file name, \"title--tag1-tag2==alias\".
+                    So \"--proj\" matches a first tag, \"-proj\" any tag,
+                    \"==\" any alias.
+  :subdir REGEXP    Emacs regexp matched against the filing subdirectory
+                    (\"\" for notes at the root).
+  :ext EXT          An extension or list of extensions, e.g. \"pdf\".
+  :since DATE       Created on or after DATE, and
+  :until DATE       created on or before DATE, judged by the note's id.
+                    See `notation--query-bound' for the forms of DATE.
+  :contains REGEXP  Ripgrep (Rust-syntax) regexp the note's content must
+                    match; smart case.
+  :links-to ID      Notes whose content links to note ID.
+  :links-from IDS   Notes that note ID links to; or, given a list of
+                    ids, exactly those notes.
+  :exclude-tags TAGS  Leave out notes with any of TAGS (default
+                    `notation-journal-tags'; nil to keep all).
+  :exclude-ids IDS  Leave out these notes.
+  :sort ORDER       One of `id' (creation, the default), `title',
+                    `modified' or `subdir'; ascending.
+  :reverse BOOL     Reverse the sort.
+  :limit N          Return at most N notes.
+
+Cheap filters run first; the ripgrep searches (:contains, :links-to)
+only look at what's left."
+  (let* ((case-fold-search t)
+         (search (plist-get params :search))
+         (subdir (plist-get params :subdir))
+         (exts (and (plist-get params :ext) (notation--as-strings (plist-get params :ext))))
+         (since (and (plist-get params :since) (notation--query-bound (plist-get params :since) nil)))
+         (until (and (plist-get params :until) (notation--query-bound (plist-get params :until) t)))
+         (exclude-tags (if (plist-member params :exclude-tags)
+                           (notation--as-strings (plist-get params :exclude-tags))
+                         notation-journal-tags))
+         (exclude-ids (notation--as-strings (plist-get params :exclude-ids)))
+         (contains (plist-get params :contains))
+         (links-to (plist-get params :links-to))
+         (links-from-p (plist-member params :links-from))
+         (links-from (plist-get params :links-from))
+         (sort-key (intern (format "%s" (or (plist-get params :sort) 'id))))
+         (limit (plist-get params :limit))
+         (notes (mapcar #'notation--note-plist (notation--find-note-files))))
+    (unless (memq sort-key notation--query-sorts)
+      (user-error "Unknown :sort %s; use one of %s" sort-key
+                  (mapconcat #'symbol-name notation--query-sorts ", ")))
+    ;; A single id means "what that note links to"; a list (possibly
+    ;; empty) is the exact set of ids to keep.
+    (setq links-from
+          (if (and links-from-p (not (listp links-from)))
+              (notation--extract-link-ids (notation-resolve-id (format "%s" links-from)))
+            (notation--as-strings links-from)))
+    (setq notes
+          (seq-filter
+           (lambda (note)
+             (let ((id (plist-get note :id)))
+               (and (not (member id exclude-ids))
+                    (not (seq-intersection (plist-get note :tags) exclude-tags))
+                    (or (null search) (string-match-p search (plist-get note :name)))
+                    (or (null subdir) (string-match-p subdir (or (plist-get note :subdir) "")))
+                    (or (null exts) (member-ignore-case (plist-get note :ext) exts))
+                    (or (null since) (not (string< id since)))
+                    (or (null until) (not (string< until id)))
+                    (or (not links-from-p) (member id links-from)))))
+           notes))
+    ;; The ripgrep filters, over the survivors only.
+    (dolist (filter (list (and links-to
+                               (let ((target (format "%s" links-to)))
+                                 (lambda (files)
+                                   (seq-remove (lambda (f) (string= (notation--id-from-file f) target))
+                                               (notation--search-text (concat "notation:" target) files)))))
+                          (and contains
+                               (lambda (files) (notation--grep-files (format "%s" contains) files)))))
+      (when (and filter notes)
+        (let ((hits (funcall filter (mapcar (lambda (n) (plist-get n :file)) notes))))
+          (setq notes (seq-filter (lambda (n) (member (plist-get n :file) hits)) notes)))))
+    (setq notes
+          (sort notes
+                (pcase sort-key
+                  ('id (lambda (a b) (string< (plist-get a :id) (plist-get b :id))))
+                  ('title (lambda (a b) (string< (plist-get a :title) (plist-get b :title))))
+                  ('modified (lambda (a b) (time-less-p (plist-get a :modified) (plist-get b :modified))))
+                  ('subdir (lambda (a b)
+                             (let ((sa (or (plist-get a :subdir) ""))
+                                   (sb (or (plist-get b :subdir) "")))
+                               (if (string= sa sb)
+                                   (string< (plist-get a :title) (plist-get b :title))
+                                 (string< sa sb))))))))
+    (when (plist-get params :reverse)
+      (setq notes (nreverse notes)))
+    (if (and limit (> (length notes) limit))
+        (seq-take notes limit)
+      notes)))
+
+;;; Org dynamic block
+;;
+;;   #+BEGIN: notation :search "-project" :sort title
+;;   #+END:
+;;
+;; Selection parameters are those of `notation-query', with `this'
+;; accepted for :links-to and :links-from (the note the block is in);
+;; see `org-dblock-write:notation' for the output parameters. Update
+;; with C-c C-c on the #+BEGIN line, or `org-update-all-dblocks'.
+
+(defconst notation--dblock-columns '(id date title tags aliases subdir ext modified)
+  "Columns accepted by the notation dynamic block's :columns.")
+
+(defun notation--buffer-note-id ()
+  "Return the id of the note visited in the current buffer, or nil."
+  (let ((file (buffer-file-name)))
+    (and file (notation--note-file-p file) (notation--id-from-file file))))
+
+(defun notation--dblock-title (note)
+  "Return NOTE's title for display, with underscores as spaces."
+  (replace-regexp-in-string "_" " " (plist-get note :title)))
+
+(defun notation--dblock-tags (note)
+  "Return NOTE's tags as \"-tag1 -tag2\"."
+  (mapconcat (lambda (tag) (concat "-" tag)) (plist-get note :tags) " "))
+
+(defun notation--dblock-aliases (note)
+  "Return NOTE's aliases as \"=alias1 =alias2\"."
+  (mapconcat (lambda (alias) (concat "=" alias)) (plist-get note :aliases) " "))
+
+(defun notation--dblock-link (note description)
+  "Return an Org link to NOTE, described according to DESCRIPTION."
+  (let ((title (notation--dblock-title note)))
+    (format "[[notation:%s][%s]]" (plist-get note :id)
+            (pcase description
+              ((or 'nil 'title) title)
+              ('title+tags (string-trim (concat title "  " (notation--dblock-tags note))))
+              (_ (user-error "Unknown :description %s; use title or title+tags" description))))))
+
+(defun notation--dblock-cell (note column description)
+  "Return the table cell for NOTE in COLUMN."
+  (pcase column
+    ('id (plist-get note :id))
+    ('date (notation--id-date (plist-get note :id)))
+    ('title (notation--dblock-link note description))
+    ('tags (notation--dblock-tags note))
+    ('aliases (notation--dblock-aliases note))
+    ('subdir (or (plist-get note :subdir) ""))
+    ('ext (plist-get note :ext))
+    ('modified (format-time-string "%Y-%m-%d %H:%M" (plist-get note :modified)))))
+
+(defun notation--dblock-groups (notes group-by)
+  "Split NOTES into an alist of (LABEL . NOTES) according to GROUP-BY.
+With `tag', a note appears under each of its tags. Groups are sorted
+by label; notes keep their order within each group."
+  (let (groups)
+    (dolist (note notes)
+      (dolist (label (pcase group-by
+                       ('subdir (list (or (plist-get note :subdir) "(root)")))
+                       ('ext (list (plist-get note :ext)))
+                       ('tag (or (plist-get note :tags) (list "(untagged)")))
+                       (_ (user-error "Unknown :group-by %s; use subdir, tag or ext" group-by))))
+        (let ((cell (assoc label groups)))
+          (if cell
+              (push note (cdr cell))
+            (push (list label note) groups)))))
+    (sort (mapcar (lambda (g) (cons (car g) (nreverse (cdr g)))) groups)
+          (lambda (a b) (string< (car a) (car b))))))
+
+(defun notation--as-symbol (value)
+  "Return VALUE (a symbol or string, or nil) as a symbol."
+  (and value (intern (format "%s" value))))
+
+(defun notation--dblock-render (notes output columns description indent)
+  "Return NOTES rendered in OUTPUT format as a list of lines.
+INDENT is prepended to list items (for nesting under a group)."
+  (pcase output
+    ((or 'nil 'list)
+     (mapcar (lambda (n) (concat indent "- " (notation--dblock-link n description))) notes))
+    ('ids
+     (mapcar (lambda (n) (concat indent "- notation:" (plist-get n :id))) notes))
+    ('table
+     (dolist (c columns)
+       (unless (memq c notation--dblock-columns)
+         (user-error "Unknown column %s; use any of %s" c
+                     (mapconcat #'symbol-name notation--dblock-columns " "))))
+     (append
+      (list (concat "| " (mapconcat #'symbol-name columns " | ") " |")
+            "|-")
+      (mapcar (lambda (n)
+                (concat "| " (mapconcat (lambda (c) (notation--dblock-cell n c description))
+                                        columns " | ")
+                        " |"))
+              notes)))
+    (_ (user-error "Unknown :format %s; use list, table or ids" output))))
+
+(defun org-dblock-write:notation (params)
+  "Write the notes matching PARAMS into a notation dynamic block.
+Selection is done by `notation-query', whose parameters are accepted
+here as well; :links-to and :links-from may be `this', meaning the
+note visited in the current buffer. Further parameters:
+
+  :exclude-self BOOL  Leave out the note the block is in (default t).
+  :format FORMAT      `list' (the default), `table', or `ids'.
+  :columns COLUMNS    For tables, any of id, date, title, tags, aliases,
+                      subdir, ext and modified (default (date title tags)).
+  :group-by KEY       `subdir', `tag' or `ext': one list or table per group.
+  :description STYLE  Link text: `title' (default) or `title+tags'.
+
+With :links-from this, links are read from the buffer rather than the
+file, so unsaved edits count; this block's own previous output does
+not, since Org empties the block before writing it."
+  (let* ((this (notation--buffer-note-id))
+         (need-this (lambda (key)
+                      (or this (user-error "%s this: this buffer isn't visiting a note" key))))
+         (query (seq-reduce (lambda (acc key)
+                              (if (plist-member params key)
+                                  (plist-put acc key (plist-get params key))
+                                acc))
+                            '(:search :subdir :ext :since :until :exclude-tags
+                              :sort :reverse :limit)
+                            nil))
+         (exclude-self (if (plist-member params :exclude-self)
+                           (plist-get params :exclude-self)
+                         t))
+         (output (notation--as-symbol (plist-get params :format)))
+         (columns (mapcar #'intern (notation--as-strings
+                                    (or (plist-get params :columns) '(date title tags)))))
+         (description (notation--as-symbol (plist-get params :description)))
+         (group-by (notation--as-symbol (plist-get params :group-by))))
+    ;; Org itself passes the block's previous text as :content, which is
+    ;; why the content search parameter is called :contains.
+    (when (plist-get params :contains)
+      (setq query (plist-put query :contains (plist-get params :contains))))
+    (pcase (plist-get params :links-to)
+      ('nil nil)
+      ((or 'this "this") (setq query (plist-put query :links-to (funcall need-this :links-to))))
+      (id (setq query (plist-put query :links-to id))))
+    (pcase (plist-get params :links-from)
+      ('nil nil)
+      ((or 'this "this")
+       (funcall need-this :links-from)
+       (setq query (plist-put query :links-from
+                              (save-excursion
+                                (goto-char (point-min))
+                                (let (ids)
+                                  (while (re-search-forward "notation:\\([0-9]\\{14\\}\\)" nil t)
+                                    (push (match-string-no-properties 1) ids))
+                                  (delete-dups (nreverse ids)))))))
+      (id (setq query (plist-put query :links-from id))))
+    (when (and exclude-self this)
+      (setq query (plist-put query :exclude-ids (list this))))
+    (let* ((notes (apply #'notation-query query))
+           (lines
+            (cond
+             ((null notes) (list "# No matching notes"))
+             (group-by
+              (apply #'append
+                     (mapcar (lambda (group)
+                               (if (eq output 'table)
+                                   (append (list (format "*%s*" (car group)))
+                                           (notation--dblock-render (cdr group) output columns description "")
+                                           (list ""))
+                                 (cons (format "- %s" (car group))
+                                       (notation--dblock-render (cdr group) output columns description "  "))))
+                             (notation--dblock-groups notes group-by))))
+             (t (notation--dblock-render notes output columns description ""))))
+           (start (point)))
+      (insert (string-trim-right (mapconcat #'identity lines "\n")))
+      (when (and notes (eq output 'table))
+        ;; Align every table just written (one per group).
+        (let ((end (copy-marker (point) t)))
+          (save-excursion
+            (goto-char start)
+            (while (re-search-forward "^[ \t]*|" end t)
+              (org-table-align)
+              (goto-char (org-table-end))))
+          (set-marker end nil))))))
+
+(defun notation-insert-dblock (search)
+  "Insert a notation dynamic block listing notes whose name matches SEARCH.
+See `notation-query' and `org-dblock-write:notation' for the
+parameters you can add to the #+BEGIN line afterwards."
+  (interactive "sNotes whose name matches (regexp): ")
+  (unless (derived-mode-p 'org-mode)
+    (user-error "Dynamic blocks need an Org buffer"))
+  (org-create-dblock (list :name "notation" :search search))
+  (org-update-dblock))
+
 ;;; Org integration
 
 (with-eval-after-load 'org
   (org-link-set-parameters
    "notation"
    :follow (lambda (id &rest _) (find-file (notation-resolve-id id)))
-   :face 'org-link))
+   :face 'org-link)
+  ;; Offered by C-c C-x x (`org-dynamic-block-insert-dblock').
+  (org-dynamic-block-define "notation" #'notation-insert-dblock))
 
 ;;; Org agenda integration
 ;;
